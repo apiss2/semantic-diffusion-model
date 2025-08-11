@@ -1,4 +1,5 @@
-# Semantic Image Synthesis via Diffusion Models (SDM)
+# 概要
+このリポジトリは Semantic Image Synthesis via Diffusion Models (SDM) の個人的に改良したものです。
 
 &nbsp;
 
