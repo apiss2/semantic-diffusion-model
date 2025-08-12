@@ -528,7 +528,6 @@ class AttentionBlock(nn.Module):
         num_heads=1,
         num_head_channels=-1,
         use_checkpoint=False,
-        use_new_attention_order=False,
     ):
         super().__init__()
         self.channels = channels
@@ -542,12 +541,8 @@ class AttentionBlock(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.norm = GroupNorm32(channels)
         self.qkv = conv_nd(1, channels, channels * 3, 1)
-        if use_new_attention_order:
-            # split qkv before split heads
-            self.attention = QKVAttention(self.num_heads)
-        else:
-            # split heads before split qkv
-            self.attention = QKVAttentionLegacy(self.num_heads)
+        # split qkv before split heads
+        self.attention = QKVAttention(self.num_heads)
 
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
@@ -581,39 +576,6 @@ def count_flops_attn(model, _x, y):
     # the combination of the value vectors.
     matmul_ops = 2 * b * (num_spatial**2) * c
     model.total_ops += torch.DoubleTensor([matmul_ops])
-
-
-class QKVAttentionLegacy(nn.Module):
-    """
-    A module which performs QKV attention. Matches legacy QKVAttention + input/ouput heads shaping
-    """
-
-    def __init__(self, n_heads):
-        super().__init__()
-        self.n_heads = n_heads
-
-    def forward(self, qkv):
-        """
-        Apply QKV attention.
-
-        :param qkv: an [N x (H * 3 * C) x T] tensor of Qs, Ks, and Vs.
-        :return: an [N x (H * C) x T] tensor after attention.
-        """
-        bs, width, length = qkv.shape
-        assert width % (3 * self.n_heads) == 0
-        ch = width // (3 * self.n_heads)
-        q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
-        scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = torch.einsum(
-            "bct,bcs->bts", q * scale, k * scale
-        )  # More stable with f16 than dividing afterwards
-        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = torch.einsum("bts,bcs->bct", weight, v)
-        return a.reshape(bs, -1, length)
-
-    @staticmethod
-    def count_flops(model, _x, y):
-        return count_flops_attn(model, _x, y)
 
 
 class QKVAttention(nn.Module):
@@ -680,8 +642,6 @@ class UNetModel(nn.Module):
                                of heads for upsampling. Deprecated.
     :param use_scale_shift_norm: use a FiLM-like conditioning mechanism.
     :param resblock_updown: use residual blocks for up/downsampling.
-    :param use_new_attention_order: use a different attention pattern for potentially
-                                    increased efficiency.
     """
 
     def __init__(
@@ -704,7 +664,6 @@ class UNetModel(nn.Module):
         num_heads_upsample=-1,
         use_scale_shift_norm=False,
         resblock_updown=False,
-        use_new_attention_order=False,
     ):
         super().__init__()
 
@@ -762,7 +721,6 @@ class UNetModel(nn.Module):
                             use_checkpoint=use_checkpoint,
                             num_heads=num_heads,
                             num_head_channels=num_head_channels,
-                            use_new_attention_order=use_new_attention_order,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -808,7 +766,6 @@ class UNetModel(nn.Module):
                 use_checkpoint=use_checkpoint,
                 num_heads=num_heads,
                 num_head_channels=num_head_channels,
-                use_new_attention_order=use_new_attention_order,
             ),
             SDMResBlock(
                 ch,
@@ -846,7 +803,6 @@ class UNetModel(nn.Module):
                             use_checkpoint=use_checkpoint,
                             num_heads=num_heads_upsample,
                             num_head_channels=num_head_channels,
-                            use_new_attention_order=use_new_attention_order,
                         )
                     )
                 if level and i == num_res_blocks:
