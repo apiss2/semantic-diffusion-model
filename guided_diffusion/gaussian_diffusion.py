@@ -88,9 +88,6 @@ class GaussianDiffusion:
     :param betas: a 1-D numpy array of betas for each diffusion timestep,
                   starting at T and going to 1.
     :param model_mean_type: a ModelMeanType determining what the model outputs.
-    :param rescale_timesteps: if True, pass floating point timesteps into the
-                              model so that they are always scaled like in the
-                              original paper (0 to 1000).
     """
 
     def __init__(
@@ -99,11 +96,9 @@ class GaussianDiffusion:
         betas,
         model_mean_type,
         model_var_type,
-        rescale_timesteps=False,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
-        self.rescale_timesteps = rescale_timesteps
 
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
@@ -321,11 +316,6 @@ class GaussianDiffusion:
             _extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
             - pred_xstart
         ) / _extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape)
-
-    def _scale_timesteps(self, t):
-        if self.rescale_timesteps:
-            return t.float() * (1000.0 / self.num_timesteps)
-        return t
 
     def condition_mean(self, cond_fn, p_mean_var, x, t, model_kwargs=None):
         """
