@@ -78,32 +78,6 @@ class ModelMeanType(enum.Enum):
     EPSILON = enum.auto()  # the model predicts epsilon
 
 
-class ModelVarType(enum.Enum):
-    """
-    What is used as the model's output variance.
-
-    The LEARNED_RANGE option has been added to allow the model to predict
-    values between FIXED_SMALL and FIXED_LARGE, making its job easier.
-    """
-
-    LEARNED = enum.auto()
-    FIXED_SMALL = enum.auto()
-    FIXED_LARGE = enum.auto()
-    LEARNED_RANGE = enum.auto()
-
-
-class LossType(enum.Enum):
-    MSE = enum.auto()  # use raw MSE loss (and KL when learning variances)
-    RESCALED_MSE = (
-        enum.auto()
-    )  # use raw MSE loss (with RESCALED_KL when learning variances)
-    KL = enum.auto()  # use the variational lower-bound
-    RESCALED_KL = enum.auto()  # like KL, but rescale to estimate the full VLB
-
-    def is_vb(self):
-        return self == LossType.KL or self == LossType.RESCALED_KL
-
-
 class GaussianDiffusion:
     """
     Utilities for training and sampling diffusion models.
@@ -114,8 +88,6 @@ class GaussianDiffusion:
     :param betas: a 1-D numpy array of betas for each diffusion timestep,
                   starting at T and going to 1.
     :param model_mean_type: a ModelMeanType determining what the model outputs.
-    :param model_var_type: a ModelVarType determining how variance is output.
-    :param loss_type: a LossType determining the loss function to use.
     :param rescale_timesteps: if True, pass floating point timesteps into the
                               model so that they are always scaled like in the
                               original paper (0 to 1000).
@@ -127,12 +99,10 @@ class GaussianDiffusion:
         betas,
         model_mean_type,
         model_var_type,
-        loss_type,
         rescale_timesteps=False,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
-        self.loss_type = loss_type
         self.rescale_timesteps = rescale_timesteps
 
         # Use float64 for accuracy.
@@ -276,36 +246,15 @@ class GaussianDiffusion:
                 model_output[:, :3] - model_output_zero[:, :3]
             )
 
-        if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
-            assert model_output.shape == (B, C * 2, *x.shape[2:])
-            model_output, model_var_values = torch.split(model_output, C, dim=1)
-            if self.model_var_type == ModelVarType.LEARNED:
-                model_log_variance = model_var_values
-                model_variance = torch.exp(model_log_variance)
-            else:
-                min_log = _extract_into_tensor(
-                    self.posterior_log_variance_clipped, t, x.shape
-                )
-                max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
-                # The model_var_values is [-1, 1] for [min_var, max_var].
-                frac = (model_var_values + 1) / 2
-                model_log_variance = frac * max_log + (1 - frac) * min_log
-                model_variance = torch.exp(model_log_variance)
-        else:
-            model_variance, model_log_variance = {
-                # for fixedlarge, we set the initial (log-)variance like so
-                # to get a better decoder log likelihood.
-                ModelVarType.FIXED_LARGE: (
-                    np.append(self.posterior_variance[1], self.betas[1:]),
-                    np.log(np.append(self.posterior_variance[1], self.betas[1:])),
-                ),
-                ModelVarType.FIXED_SMALL: (
-                    self.posterior_variance,
-                    self.posterior_log_variance_clipped,
-                ),
-            }[self.model_var_type]
-            model_variance = _extract_into_tensor(model_variance, t, x.shape)
-            model_log_variance = _extract_into_tensor(model_log_variance, t, x.shape)
+        # LEARNED_RANGE
+        assert model_output.shape == (B, C * 2, *x.shape[2:])
+        model_output, model_var_values = torch.split(model_output, C, dim=1)
+        min_log = _extract_into_tensor(self.posterior_log_variance_clipped, t, x.shape)
+        max_log = _extract_into_tensor(np.log(self.betas), t, x.shape)
+        # The model_var_values is [-1, 1] for [min_var, max_var].
+        frac = (model_var_values + 1) / 2
+        model_log_variance = frac * max_log + (1 - frac) * min_log
+        model_variance = torch.exp(model_log_variance)
 
         def process_xstart(x):
             if denoised_fn is not None:
@@ -866,57 +815,35 @@ class GaussianDiffusion:
 
         terms = {}
 
-        if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
-            terms["loss"] = self._vb_terms_bpd(
-                model=model,
-                x_start=x_start,
-                x_t=x_t,
-                t=t,
-                clip_denoised=False,
-                model_kwargs=model_kwargs,
-            )["output"]
-            if self.loss_type == LossType.RESCALED_KL:
-                terms["loss"] *= self.num_timesteps
-        elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, self._scale_timesteps(t), y=model_kwargs["y"])
+        model_output = model(x_t, self._scale_timesteps(t), y=model_kwargs["y"])
 
-            if self.model_var_type in [
-                ModelVarType.LEARNED,
-                ModelVarType.LEARNED_RANGE,
-            ]:
-                B, C = x_t.shape[:2]
-                assert model_output.shape == (B, C * 2, *x_t.shape[2:])
-                model_output, model_var_values = torch.split(model_output, C, dim=1)
-                # Learn the variance using the variational bound, but don't let
-                # it affect our mean prediction.
-                frozen_out = torch.cat([model_output.detach(), model_var_values], dim=1)
-                terms["vb"] = self._vb_terms_bpd(
-                    model=lambda *args, r=frozen_out: r,
-                    x_start=x_start,
-                    x_t=x_t,
-                    t=t,
-                    clip_denoised=False,
-                )["output"]
-                if self.loss_type == LossType.RESCALED_MSE:
-                    # Divide by 1000 for equivalence with initial implementation.
-                    # Without a factor of 1/1000, the VB term hurts the MSE term.
-                    terms["vb"] *= self.num_timesteps / 1000.0
+        B, C = x_t.shape[:2]
+        assert model_output.shape == (B, C * 2, *x_t.shape[2:])
+        model_output, model_var_values = torch.split(model_output, C, dim=1)
+        # Learn the variance using the variational bound, but don't let
+        # it affect our mean prediction.
+        frozen_out = torch.cat([model_output.detach(), model_var_values], dim=1)
+        terms["vb"] = self._vb_terms_bpd(
+            model=lambda *args, r=frozen_out: r,
+            x_start=x_start,
+            x_t=x_t,
+            t=t,
+            clip_denoised=False,
+        )["output"]
 
-            target = {
-                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                    x_start=x_start, x_t=x_t, t=t
-                )[0],
-                ModelMeanType.START_X: x_start,
-                ModelMeanType.EPSILON: noise,
-            }[self.model_mean_type]
-            assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
-            if "vb" in terms:
-                terms["loss"] = terms["mse"] + terms["vb"]
-            else:
-                terms["loss"] = terms["mse"]
+        target = {
+            ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
+                x_start=x_start, x_t=x_t, t=t
+            )[0],
+            ModelMeanType.START_X: x_start,
+            ModelMeanType.EPSILON: noise,
+        }[self.model_mean_type]
+        assert model_output.shape == target.shape == x_start.shape
+        terms["mse"] = mean_flat((target - model_output) ** 2)
+        if "vb" in terms:
+            terms["loss"] = terms["mse"] + terms["vb"]
         else:
-            raise NotImplementedError(self.loss_type)
+            terms["loss"] = terms["mse"]
 
         return terms
 
