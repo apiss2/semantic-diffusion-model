@@ -8,10 +8,9 @@ import torch as th
 from torch.optim import AdamW
 
 from .fp16_util import MixedPrecisionTrainer
-from .nn import update_ema
-from .resample import LossAwareSampler, UniformSampler
 from .gaussian_diffusion import GaussianDiffusion
-from .unet import UNetModel
+from .model import UNetModel, update_ema
+from .resample import LossAwareSampler, UniformSampler
 
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
@@ -130,9 +129,7 @@ class TrainLoop:
             self.run_step(batch, cond)
             if self.step % self.save_interval == 0:
                 self.save()
-                self.sanity_test(
-                    batch=batch, device="cuda", cond=cond, gray_scale=self.gray_scale
-                )
+                self.sanity_test(batch=batch, device="cuda", cond=cond)
                 # Run for a finite amount of time in integration tests.
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
@@ -140,9 +137,7 @@ class TrainLoop:
         # Save the last checkpoint if it wasn't already saved.
         if (self.step - 1) % self.save_interval != 0:
             self.save()
-            self.sanity_test(
-                batch=batch, device="cuda", cond=cond, gray_scale=self.gray_scale
-            )
+            self.sanity_test(batch=batch, device="cuda", cond=cond)
 
     def run_step(self, batch, cond):
         self.forward_backward(batch, cond)
@@ -239,6 +234,7 @@ class TrainLoop:
             snapshots=snapshots,
             output_dir="./results",
             step=self.step,
+            grayscale=self.gray_scale,
         )
 
     def preprocess_input(self, data):
