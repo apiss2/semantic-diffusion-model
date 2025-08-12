@@ -16,7 +16,6 @@ def diffusion_defaults():
         diffusion_steps=1000,
         noise_schedule="linear",
         timestep_respacing="",
-        predict_xstart=False,
     )
 
 
@@ -63,7 +62,6 @@ def create_model_and_diffusion(
     diffusion_steps,
     noise_schedule,
     timestep_respacing,
-    predict_xstart,
     use_checkpoint,
     use_scale_shift_norm,
     resblock_updown,
@@ -92,7 +90,6 @@ def create_model_and_diffusion(
         steps=diffusion_steps,
         learn_sigma=learn_sigma,
         noise_schedule=noise_schedule,
-        predict_xstart=predict_xstart,
         timestep_respacing=timestep_respacing,
     )
     return model, diffusion
@@ -163,7 +160,6 @@ def create_gaussian_diffusion(
     learn_sigma=False,
     sigma_small=False,
     noise_schedule="linear",
-    predict_xstart=False,
     timestep_respacing="",
 ):
     betas = gd.get_named_beta_schedule(noise_schedule, steps)
@@ -172,9 +168,6 @@ def create_gaussian_diffusion(
     return SpacedDiffusion(
         use_timesteps=space_timesteps(steps, timestep_respacing),
         betas=betas,
-        model_mean_type=(
-            gd.ModelMeanType.EPSILON if not predict_xstart else gd.ModelMeanType.START_X
-        ),
     )
 
 

@@ -68,16 +68,6 @@ def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
     return np.array(betas)
 
 
-class ModelMeanType(enum.Enum):
-    """
-    Which type of output the model predicts.
-    """
-
-    PREVIOUS_X = enum.auto()  # the model predicts x_{t-1}
-    START_X = enum.auto()  # the model predicts x_0
-    EPSILON = enum.auto()  # the model predicts epsilon
-
-
 class GaussianDiffusion:
     """
     Utilities for training and sampling diffusion models.
@@ -87,19 +77,9 @@ class GaussianDiffusion:
 
     :param betas: a 1-D numpy array of betas for each diffusion timestep,
                   starting at T and going to 1.
-    :param model_mean_type: a ModelMeanType determining what the model outputs.
     """
 
-    def __init__(
-        self,
-        *,
-        betas,
-        model_mean_type,
-        model_var_type,
-    ):
-        self.model_mean_type = model_mean_type
-        self.model_var_type = model_var_type
-
+    def __init__(self, *, betas):
         # Use float64 for accuracy.
         betas = np.array(betas, dtype=np.float64)
         self.betas = betas
@@ -266,23 +246,12 @@ class GaussianDiffusion:
                     )
             return x
 
-        if self.model_mean_type == ModelMeanType.PREVIOUS_X:
-            pred_xstart = process_xstart(
-                self._predict_xstart_from_xprev(x_t=x, t=t, xprev=model_output)
-            )
-            model_mean = model_output
-        elif self.model_mean_type in [ModelMeanType.START_X, ModelMeanType.EPSILON]:
-            if self.model_mean_type == ModelMeanType.START_X:
-                pred_xstart = process_xstart(model_output)
-            else:
-                pred_xstart = process_xstart(
-                    self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
-                )
-            model_mean, _, _ = self.q_posterior_mean_variance(
-                x_start=pred_xstart, x_t=x, t=t
-            )
-        else:
-            raise NotImplementedError(self.model_mean_type)
+        pred_xstart = process_xstart(
+            self._predict_xstart_from_eps(x_t=x, t=t, eps=model_output)
+        )
+        model_mean, _, _ = self.q_posterior_mean_variance(
+            x_start=pred_xstart, x_t=x, t=t
+        )
 
         assert (
             model_mean.shape == model_log_variance.shape == pred_xstart.shape == x.shape
@@ -821,15 +790,8 @@ class GaussianDiffusion:
             clip_denoised=False,
         )["output"]
 
-        target = {
-            ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
-                x_start=x_start, x_t=x_t, t=t
-            )[0],
-            ModelMeanType.START_X: x_start,
-            ModelMeanType.EPSILON: noise,
-        }[self.model_mean_type]
-        assert model_output.shape == target.shape == x_start.shape
-        terms["mse"] = mean_flat((target - model_output) ** 2)
+        assert model_output.shape == noise.shape == x_start.shape
+        terms["mse"] = mean_flat((noise - model_output) ** 2)
         if "vb" in terms:
             terms["loss"] = terms["mse"] + terms["vb"]
         else:
