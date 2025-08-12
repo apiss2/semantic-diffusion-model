@@ -10,12 +10,12 @@ from torch.utils.data import DataLoader, Dataset
 def create_dataloader(
     image_dir,
     label_dir,
-    transforms,
     size,
     num_classes,
     batch_size,
     num_workers,
-    deterministic,
+    deterministic=False,
+    transforms=None,
     image_suffix=".jpg",
     label_suffix=".png",
     grayscale=False,
@@ -71,8 +71,8 @@ class SDMDataset(Dataset):
         self.num_classes = num_classes
         assert self.image_dir.exists()
         assert self.label_dir.exists()
-        self.image_pathes = list()
-        self.label_pathes = list()
+        self.image_pathes: list[Path] = list()
+        self.label_pathes: list[Path] = list()
         for image_path in self.image_dir.glob(f"*{image_suffix}"):
             label_path = self.label_dir.joinpath(image_path.stem + label_suffix)
             if label_path.exists():
@@ -107,6 +107,6 @@ class SDMDataset(Dataset):
         img = torch.from_numpy(img).permute(2, 0, 1)  # (C, H, W)
 
         out_dict = dict()
-        out_dict["path"] = self.image_pathes[i]
+        out_dict["path"] = self.image_pathes[i].as_posix()
         out_dict["label"] = np.expand_dims(aug["mask"], 0)
         return img, out_dict

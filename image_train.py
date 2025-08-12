@@ -1,12 +1,7 @@
-"""
-Train a diffusion model on images.
-"""
-
-import os
 import argparse
 
-from guided_diffusion import dist_util, logger
-from guided_diffusion.image_datasets import load_data
+import torch
+from guided_diffusion.image_datasets import create_dataloader
 from guided_diffusion.resample import create_named_schedule_sampler
 from guided_diffusion.script_util import (
     model_and_diffusion_defaults,
@@ -18,29 +13,24 @@ from guided_diffusion.train_util import TrainLoop
 
 
 def main():
+    assert torch.cuda.is_available()
     args = create_argparser().parse_args()
 
-    dist_util.setup_dist()
-    logger.configure()
-
-    logger.log("creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
-    model.to(dist_util.dev())
+    model.to("cuda")
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
 
-    logger.log("creating data loader...")
-    data = load_data(
-        dataset_mode=args.dataset_mode,
-        data_dir=args.data_dir,
+    data = create_dataloader(
+        image_dir=args.image_dir,
+        label_dir=args.label_dir,
+        size=args.image_size,
+        num_classes=19,
         batch_size=args.batch_size,
-        image_size=args.image_size,
-        class_cond=args.class_cond,
-        is_train=args.is_train
+        num_workers=8,
     )
 
-    logger.log("training...")
     TrainLoop(
         model=model,
         diffusion=diffusion,
@@ -64,22 +54,22 @@ def main():
 
 def create_argparser():
     defaults = dict(
-        data_dir="",
-        dataset_mode="",
+        image_dir="D:/Datasets/CelebAMask-HQ/CelebA-HQ-img-512/",
+        label_dir="D:/Datasets/CelebAMask-HQ/CelebAMask-HQ-mask-img/",
         schedule_sampler="uniform",
         lr=1e-4,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        batch_size=1,
+        batch_size=4,
         microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values
         drop_rate=0.0,
         log_interval=10,
-        save_interval=10000,
+        save_interval=1000,
         resume_checkpoint="",
-        use_fp16=False,
+        use_fp16=True,
         fp16_scale_growth=1e-3,
-        is_train=True
+        is_train=True,
     )
     defaults.update(model_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

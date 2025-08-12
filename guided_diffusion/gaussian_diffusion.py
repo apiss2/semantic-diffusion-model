@@ -257,14 +257,18 @@ class GaussianDiffusion:
 
         B, C = x.shape[:2]
         assert t.shape == (B,)
-        if 'y' in model_kwargs:
-            model_output = model(x, self._scale_timesteps(t), y=model_kwargs['y'])
+        if "y" in model_kwargs:
+            model_output = model(x, self._scale_timesteps(t), y=model_kwargs["y"])
         else:
             model_output = model(x, self._scale_timesteps(t), **model_kwargs)
 
-        if 's' in model_kwargs and model_kwargs['s'] > 1.0:
-            model_output_zero = model(x, self._scale_timesteps(t), y=th.zeros_like(model_kwargs['y']))
-            model_output[:, :3] = model_output_zero[:, :3] + model_kwargs['s'] * (model_output[:, :3] - model_output_zero[:, :3])
+        if "s" in model_kwargs and model_kwargs["s"] > 1.0:
+            model_output_zero = model(
+                x, self._scale_timesteps(t), y=th.zeros_like(model_kwargs["y"])
+            )
+            model_output[:, :3] = model_output_zero[:, :3] + model_kwargs["s"] * (
+                model_output[:, :3] - model_output_zero[:, :3]
+            )
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -302,9 +306,14 @@ class GaussianDiffusion:
                 x = denoised_fn(x)
             if clip_denoised:
                 x = x.clamp(-1, 1)
-                if 'mean' in model_kwargs and 'std' in model_kwargs:
-                    x = (x - x.mean(dim=(2, 3), keepdim=True)) / x.std(dim=(2, 3), keepdim=True)
-                    x = x * model_kwargs["std"][None, :, None, None] + model_kwargs["mean"][None, :, None, None]
+                if "mean" in model_kwargs and "std" in model_kwargs:
+                    x = (x - x.mean(dim=(2, 3), keepdim=True)) / x.std(
+                        dim=(2, 3), keepdim=True
+                    )
+                    x = (
+                        x * model_kwargs["std"][None, :, None, None]
+                        + model_kwargs["mean"][None, :, None, None]
+                    )
             return x
 
         if self.model_mean_type == ModelMeanType.PREVIOUS_X:
@@ -521,8 +530,8 @@ class GaussianDiffusion:
             img = noise
         else:
             img = th.randn(*shape, device=device)
-        if 'y' in model_kwargs:
-            model_kwargs['y'] = model_kwargs['y'].to(device)
+        if "y" in model_kwargs:
+            model_kwargs["y"] = model_kwargs["y"].to(device)
         indices = list(range(self.num_timesteps))[::-1]
 
         if progress:
@@ -545,6 +554,81 @@ class GaussianDiffusion:
                 )
                 yield out
                 img = out["sample"]
+
+    def p_sample_loop_with_snapshot(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+    ):
+        """
+        Generate samples from the model.
+
+        :param model: the model module.
+        :param shape: the shape of the samples, (N, C, H, W).
+        :param noise: if specified, the noise from the encoder to sample.
+                      Should be of the same shape as `shape`.
+        :param clip_denoised: if True, clip x_start predictions to [-1, 1].
+        :param denoised_fn: if not None, a function which applies to the
+            x_start prediction before it is used to sample.
+        :param cond_fn: if not None, this is a gradient function that acts
+                        similarly to the model.
+        :param model_kwargs: if not None, a dict of extra keyword arguments to
+            pass to the model. This can be used for conditioning.
+        :param device: if specified, the device to create the samples on.
+                       If not specified, use a model parameter's device.
+        :param progress: if True, show a tqdm progress bar.
+        :return: a non-differentiable batch of samples.
+        """
+        final = None
+        snapshots = {}  # To store snapshots at 25%, 50%, and 75%
+
+        total_steps = self.num_timesteps
+        checkpoints = [
+            total_steps // 4,
+            total_steps // 2,
+            total_steps * 3 // 4,
+            total_steps * 0.85,
+            total_steps * 0.95,
+        ]
+
+        for idx, sample in enumerate(
+            self.p_sample_loop_progressive(
+                model,
+                shape,
+                noise=noise,
+                clip_denoised=clip_denoised,
+                denoised_fn=denoised_fn,
+                cond_fn=cond_fn,
+                model_kwargs=model_kwargs,
+                device=device,
+                progress=progress,
+            )
+        ):
+            # The idx here starts from 0, so we adjust the calculation accordingly.
+            # Since indices are in reverse, calculate the current progress from the end.
+            current_progress = idx
+
+            # Check if the current progress is close to any of the checkpoints
+            for checkpoint in checkpoints:
+                if abs(current_progress - checkpoint) < 1:
+                    # Save the current sample as a snapshot at the corresponding percentage
+                    percentage = int((current_progress / total_steps) * 100)
+                    snapshots[f"{percentage}%"] = sample[
+                        "sample"
+                    ]  # Assuming sample contains the image tensor
+
+            final = sample
+
+        # At this point, `snapshots` will contain the images at approximately 25%, 50%, and 75% of the denoising process,
+        # and `final` will contain the last sample from the loop.
+        return final["sample"], snapshots
 
     def ddim_sample(
         self,
@@ -588,7 +672,7 @@ class GaussianDiffusion:
         noise = th.randn_like(x)
         mean_pred = (
             out["pred_xstart"] * th.sqrt(alpha_bar_prev)
-            + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
+            + th.sqrt(1 - alpha_bar_prev - sigma**2) * eps
         )
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
@@ -786,7 +870,7 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, self._scale_timesteps(t), y=model_kwargs['y'])
+            model_output = model(x_t, self._scale_timesteps(t), y=model_kwargs["y"])
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
