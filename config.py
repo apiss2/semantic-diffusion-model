@@ -66,9 +66,6 @@ class Config(BaseSettings):
     use_fp16: bool = Field(True)
     grayscale: bool = Field(False)
 
-    # その他定義
-    schedule_sampler: str = "uniform"
-
     train: TrainConfig = TrainConfig()
     dataset: DatasetConfig = DatasetConfig()
     model: ModelConfig = ModelConfig()

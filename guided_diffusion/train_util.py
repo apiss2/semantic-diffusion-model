@@ -4,13 +4,14 @@ import os
 
 import blobfile as bf
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
 import torch as th
 from torch.optim import AdamW
 
 from .fp16_util import MixedPrecisionTrainer
 from .gaussian_diffusion import GaussianDiffusion
 from .model import UNetModel, update_ema
-from .resample import LossAwareSampler, UniformSampler
 
 # For ImageNet experiments, this was a good default value.
 # We found that the lg_loss_scale quickly climbed to
@@ -34,7 +35,6 @@ class TrainLoop:
         resume_checkpoint,
         use_fp16=False,
         fp16_scale_growth=1e-3,
-        schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
         grayscale=False,
@@ -55,7 +55,7 @@ class TrainLoop:
         self.resume_checkpoint = resume_checkpoint
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
-        self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
+        self.schedule_sampler = UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
         self.grayscale = grayscale
@@ -166,11 +166,6 @@ class TrainLoop:
                 with self.model.no_sync():
                     losses = compute_losses()
 
-            if isinstance(self.schedule_sampler, LossAwareSampler):
-                self.schedule_sampler.update_with_local_losses(
-                    t, losses["loss"].detach()
-                )
-
             loss = (losses["loss"] * weights).mean()
             self.mp_trainer.backward(loss)
         print(f"\rstep: {self.step} | loss: {loss.detach().cpu().numpy():.4f}", end="")
@@ -272,6 +267,33 @@ class TrainLoop:
         edge[:, :, 1:, :] = edge[:, :, 1:, :] | (t[:, :, 1:, :] != t[:, :, :-1, :])
         edge[:, :, :-1, :] = edge[:, :, :-1, :] | (t[:, :, 1:, :] != t[:, :, :-1, :])
         return edge.float()
+
+
+class UniformSampler:
+    def __init__(self, diffusion):
+        self.diffusion = diffusion
+        self._weights = np.ones([diffusion.num_timesteps])
+
+    def weights(self):
+        return self._weights
+
+    def sample(self, batch_size, device):
+        """
+        Importance-sample timesteps for a batch.
+
+        :param batch_size: the number of timesteps.
+        :param device: the torch device to save to.
+        :return: a tuple (timesteps, weights):
+                 - timesteps: a tensor of timestep indices.
+                 - weights: a tensor of weights to scale the resulting losses.
+        """
+        w = self.weights()
+        p = w / np.sum(w)
+        indices_np = np.random.choice(len(p), size=(batch_size,), p=p)
+        indices = torch.from_numpy(indices_np).long().to(device)
+        weights_np = 1 / (len(p) * p[indices_np])
+        weights = torch.from_numpy(weights_np).float().to(device)
+        return indices, weights
 
 
 def parse_resume_step_from_filename(filename):
