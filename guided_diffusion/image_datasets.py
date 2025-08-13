@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader, Dataset
 def create_dataloader(
     image_dir,
     label_dir,
-    size,
+    image_size,
     num_classes,
     batch_size,
     num_workers,
@@ -27,7 +27,7 @@ def create_dataloader(
         label_suffix=label_suffix,
         transforms=transforms,
         num_classes=num_classes,
-        size=size,
+        size=image_size,
         grayscale=grayscale,
     )
 

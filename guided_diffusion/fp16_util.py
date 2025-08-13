@@ -1,9 +1,5 @@
-"""
-Helpers to train with 16-bit precision.
-"""
-
 import numpy as np
-import torch as th
+import torch
 import torch.nn as nn
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
@@ -11,24 +7,24 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 INITIAL_LOG_LOSS_SCALE = 20.0
 
 
-def convert_module_to_f16(l):
+def convert_module_to_f16(layer):
     """
     Convert primitive modules to float16.
     """
-    if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-        l.weight.data = l.weight.data.half()
-        if l.bias is not None:
-            l.bias.data = l.bias.data.half()
+    if isinstance(layer, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+        layer.weight.data = layer.weight.data.half()
+        if layer.bias is not None:
+            layer.bias.data = layer.bias.data.half()
 
 
-def convert_module_to_f32(l):
+def convert_module_to_f32(layer):
     """
     Convert primitive modules to float32, undoing convert_module_to_f16().
     """
-    if isinstance(l, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-        l.weight.data = l.weight.data.float()
-        if l.bias is not None:
-            l.bias.data = l.bias.data.float()
+    if isinstance(layer, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+        layer.weight.data = layer.weight.data.float()
+        if layer.bias is not None:
+            layer.bias.data = layer.bias.data.float()
 
 
 def make_master_params(param_groups_and_shapes):
@@ -141,7 +137,7 @@ def param_grad_or_zeros(param):
     if param.grad is not None:
         return param.grad.data.detach()
     else:
-        return th.zeros_like(param)
+        return torch.zeros_like(param)
 
 
 class MixedPrecisionTrainer:
@@ -172,20 +168,20 @@ class MixedPrecisionTrainer:
     def zero_grad(self):
         zero_grad(self.model_params)
 
-    def backward(self, loss: th.Tensor):
+    def backward(self, loss: torch.Tensor):
         if self.use_fp16:
             loss_scale = 2**self.lg_loss_scale
             (loss * loss_scale).backward()
         else:
             loss.backward()
 
-    def optimize(self, opt: th.optim.Optimizer):
+    def optimize(self, opt: torch.optim.Optimizer):
         if self.use_fp16:
             return self._optimize_fp16(opt)
         else:
             return self._optimize_normal(opt)
 
-    def _optimize_fp16(self, opt: th.optim.Optimizer):
+    def _optimize_fp16(self, opt: torch.optim.Optimizer):
         model_grads_to_master_grads(self.param_groups_and_shapes, self.master_params)
         grad_norm, _ = self._compute_norms(grad_scale=2**self.lg_loss_scale)
         if check_overflow(grad_norm):
@@ -200,7 +196,7 @@ class MixedPrecisionTrainer:
         self.lg_loss_scale += self.fp16_scale_growth
         return True
 
-    def _optimize_normal(self, opt: th.optim.Optimizer):
+    def _optimize_normal(self, opt: torch.optim.Optimizer):
         self._compute_norms()
         opt.step()
         return True
@@ -209,10 +205,12 @@ class MixedPrecisionTrainer:
         grad_norm = 0.0
         param_norm = 0.0
         for p in self.master_params:
-            with th.no_grad():
-                param_norm += th.norm(p, p=2, dtype=th.float32).item() ** 2
+            with torch.no_grad():
+                param_norm += torch.norm(p, p=2, dtype=torch.float32).item() ** 2
                 if p.grad is not None:
-                    grad_norm += th.norm(p.grad, p=2, dtype=th.float32).item() ** 2
+                    grad_norm += (
+                        torch.norm(p.grad, p=2, dtype=torch.float32).item() ** 2
+                    )
         return np.sqrt(grad_norm) / grad_scale, np.sqrt(param_norm)
 
     def master_params_to_state_dict(self, master_params):

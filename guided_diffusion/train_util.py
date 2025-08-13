@@ -27,11 +27,9 @@ class TrainLoop:
         data,
         num_classes,
         batch_size,
-        microbatch,
         lr,
         ema_rate,
         drop_rate,
-        log_interval,
         save_interval,
         resume_checkpoint,
         use_fp16=False,
@@ -39,14 +37,13 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
-        gray_scale=False,
+        grayscale=False,
     ):
         self.model: UNetModel = model
         self.diffusion: GaussianDiffusion = diffusion
         self.data = data
         self.num_classes = num_classes
         self.batch_size = batch_size
-        self.microbatch = microbatch if microbatch > 0 else batch_size
         self.lr = lr
         self.ema_rate = (
             [ema_rate]
@@ -54,7 +51,6 @@ class TrainLoop:
             else [float(x) for x in ema_rate.split(",")]
         )
         self.drop_rate = drop_rate
-        self.log_interval = log_interval
         self.save_interval = save_interval
         self.resume_checkpoint = resume_checkpoint
         self.use_fp16 = use_fp16
@@ -62,7 +58,7 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
-        self.gray_scale = gray_scale
+        self.grayscale = grayscale
 
         self.step = 1
         self.resume_step = 0
@@ -148,12 +144,12 @@ class TrainLoop:
 
     def forward_backward(self, batch, cond):
         self.mp_trainer.zero_grad()
-        for i in range(0, batch.shape[0], self.microbatch):
-            micro = batch[i : i + self.microbatch].to("cuda")
+        for i in range(0, batch.shape[0], self.batch_size):
+            micro = batch[i : i + self.batch_size].to("cuda")
             micro_cond = {
-                k: v[i : i + self.microbatch].to("cuda") for k, v in cond.items()
+                k: v[i : i + self.batch_size].to("cuda") for k, v in cond.items()
             }
-            last_batch = (i + self.microbatch) >= batch.shape[0]
+            last_batch = (i + self.batch_size) >= batch.shape[0]
             t, weights = self.schedule_sampler.sample(micro.shape[0], "cuda")
 
             compute_losses = functools.partial(
@@ -234,7 +230,7 @@ class TrainLoop:
             snapshots=snapshots,
             output_dir="./results",
             step=self.step,
-            grayscale=self.gray_scale,
+            grayscale=self.grayscale,
         )
 
     def preprocess_input(self, data):
