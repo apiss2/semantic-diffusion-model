@@ -1,5 +1,7 @@
 import copy
 import os
+from pathlib import Path
+from typing import Iterator
 
 import blobfile as bf
 import matplotlib.pyplot as plt
@@ -7,10 +9,11 @@ import numpy as np
 import torch
 import torch as th
 from diffusers.schedulers import DDPMScheduler
+from torch.amp import GradScaler
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .fp16_util import MixedPrecisionTrainer
 from .losses import vb_terms_bits_per_dim
 from .model import UNetModel, update_ema
 
@@ -25,20 +28,20 @@ class TrainLoop:
         self,
         model: UNetModel,
         scheduler: DDPMScheduler,
-        data,
-        num_classes,
-        batch_size,
-        lr,
-        ema_rate,
-        drop_rate,
-        save_interval,
-        resume_checkpoint,
-        num_train_timesteps=1000,
-        use_fp16=False,
-        fp16_scale_growth=1e-3,
-        weight_decay=0.0,
-        lr_anneal_steps=0,
-        grayscale=False,
+        data: Iterator[DataLoader],
+        num_classes: int,
+        batch_size: int,
+        lr: float,
+        ema_rate: str,
+        drop_rate: float,
+        save_interval: int,
+        resume_checkpoint: str,
+        num_train_timesteps: int = 1000,
+        use_fp16: bool = True,
+        fp16_scale_growth: float = 1e-3,
+        weight_decay: float = 0.0,
+        lr_anneal_steps: int = 0,
+        grayscale: bool = False,
     ):
         self.model: UNetModel = model
         self.scheduler: DDPMScheduler = scheduler
@@ -53,7 +56,7 @@ class TrainLoop:
         )
         self.drop_rate = drop_rate
         self.save_interval = save_interval
-        self.resume_checkpoint = resume_checkpoint
+        self.resume_checkpoint = Path(resume_checkpoint) if resume_checkpoint else None
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
         self.schedule_sampler = UniformSampler(num_train_timesteps)
@@ -64,51 +67,45 @@ class TrainLoop:
         self.step = 1
         self.resume_step = 0
 
-        self._load_and_sync_parameters()
-        self.mp_trainer = MixedPrecisionTrainer(
-            model=self.model,
-            use_fp16=self.use_fp16,
-            fp16_scale_growth=fp16_scale_growth,
+        self._load_checkpoint()
+
+        self.scaler = GradScaler(enabled=self.use_fp16)
+        self.opt = AdamW(
+            self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
         )
 
-        self.opt = AdamW(
-            self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
-        )
         if self.resume_step:
             self._load_optimizer_state()
             # Model was resumed, either due to a restart or a checkpoint
             # being specified at the command line.
-            self.ema_params = [
-                self._load_ema_parameters(rate) for rate in self.ema_rate
-            ]
+            self.ema_models = [self._load_ema_model(rate) for rate in self.ema_rate]
+            self.ema_models = [model for model in self.ema_models if model is not None]
         else:
-            self.ema_params = [
-                copy.deepcopy(self.mp_trainer.master_params)
-                for _ in range(len(self.ema_rate))
-            ]
+            self.ema_models = [copy.deepcopy(self.model).eval() for _ in self.ema_rate]
+            for m in self.ema_models:
+                for p in m.parameters():
+                    p.requires_grad_(False)
 
-    def _load_and_sync_parameters(self):
-        resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
+    def _load_checkpoint(self):
+        if self.resume_checkpoint:
+            self.resume_step = parse_resume_step_from_filename(self.resume_checkpoint)
+            self.model.load_state_dict(th.load(self.resume_checkpoint))
 
-        if resume_checkpoint:
-            self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
-            self.model.load_state_dict(th.load(resume_checkpoint))
-
-    def _load_ema_parameters(self, rate):
-        ema_params = copy.deepcopy(self.mp_trainer.master_params)
-
-        main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
-        ema_checkpoint = find_ema_checkpoint(main_checkpoint, self.resume_step, rate)
+    def _load_ema_model(self, rate):
+        ema_checkpoint = find_ema_checkpoint(
+            self.resume_checkpoint, self.resume_step, rate
+        )
         if ema_checkpoint:
+            model = copy.deepcopy(self.model)
             state_dict = th.load(ema_checkpoint)
-            ema_params = self.mp_trainer.state_dict_to_master_params(state_dict)
-
-        return ema_params
+            ema_model = model.load_state_dict(state_dict)
+            return ema_model
+        else:
+            None
 
     def _load_optimizer_state(self):
-        main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
         opt_checkpoint = bf.join(
-            bf.dirname(main_checkpoint), f"opt{self.resume_step:06}.pt"
+            bf.dirname(self.resume_checkpoint), f"opt{self.resume_step:06}.pt"
         )
         if bf.exists(opt_checkpoint):
             self.opt.load_state_dict(th.load(opt_checkpoint))
@@ -136,45 +133,49 @@ class TrainLoop:
             self.save()
             self.sanity_test(batch=batch, device="cuda", cond=cond)
 
-    def run_step(self, batch, cond):
-        self.forward_backward(batch, cond)
-        took_step = self.mp_trainer.optimize(self.opt)
-        if took_step:
-            self._update_ema()
-        self._anneal_lr()
-
-    def forward_backward(self, batch, cond):
-        self.mp_trainer.zero_grad()
+    def run_step(self, batch: torch.Tensor, cond: dict[str, torch.Tensor]):
+        self.opt.zero_grad()
         batch = batch.to("cuda")
         cond = {k: v.to("cuda") for k, v in cond.items()}
         t, weights = self.schedule_sampler.sample(batch.shape[0], "cuda")
         noise = torch.randn_like(batch, device="cuda")
         x_t = self.scheduler.add_noise(batch, noise, t)
 
-        # モデル前向き（2*C 出力は現状維持）
-        model_out = self.model(x_t, t, y=cond["y"])
-        eps_pred, var_raw = torch.split(model_out, batch.shape[1], dim=1)
+        # AMP
+        autocast_dtype = torch.float16 if self.use_fp16 else torch.float32
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=True):
+            model_out = self.model(x_t, t, y=cond["y"])  # 2C 出力は現状維持
+            eps_pred, var_raw = torch.split(model_out, batch.shape[1], dim=1)
 
-        # ====== MSE(ε) ======
-        mse = ((noise - eps_pred) ** 2).mean(dim=(1, 2, 3))  # mean_flat と同等
+            # ====== MSE(ε) ======
+            mse = ((noise - eps_pred) ** 2).mean(dim=(1, 2, 3))  # mean_flat と同等
 
-        # ====== VB 項（KL or NLL@t=0） ======
-        vb = vb_terms_bits_per_dim(
-            scheduler=self.scheduler,
-            x_start=batch,
-            x_t=x_t,
-            t=t,
-            eps_pred_detached=eps_pred.detach(),  # meanには勾配を流さない
-            var_raw=var_raw,
-        )
+            # ====== VB 項（KL or NLL@t=0） ======
+            vb = vb_terms_bits_per_dim(
+                scheduler=self.scheduler,
+                x_start=batch,
+                x_t=x_t,
+                t=t,
+                eps_pred_detached=eps_pred.detach(),  # meanには勾配を流さない
+                var_raw=var_raw,
+            )
+            # total loss
+            loss = ((mse + vb) * weights).mean()
 
-        loss = ((mse + vb) * weights).mean()
-        self.mp_trainer.backward(loss)
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.opt)
+        self.scaler.update()
+        self._update_ema()
+        self._anneal_lr()
+
         print(f"\rstep: {self.step} | loss: {loss.detach().cpu().numpy():.4f}", end="")
 
     def _update_ema(self):
-        for rate, params in zip(self.ema_rate, self.ema_params):
-            update_ema(params, self.mp_trainer.master_params, rate=rate)
+        # 既存の update_ema(target_params, source_params, rate) を再利用
+        for rate, ema_model in zip(self.ema_rate, self.ema_models):
+            update_ema(
+                ema_model.parameters(), self.model.parameters(), rate=float(rate)
+            )
 
     def _anneal_lr(self):
         if not self.lr_anneal_steps:
@@ -185,28 +186,18 @@ class TrainLoop:
             param_group["lr"] = lr
 
     def save(self):
-        def save_checkpoint(rate, params):
-            state_dict = self.mp_trainer.master_params_to_state_dict(params)
-            if not rate:
-                filename = f"model{(self.step + self.resume_step):06d}.pt"
-            else:
-                filename = f"ema_{rate}_{(self.step + self.resume_step):06d}.pt"
-            # TODO
-            with bf.BlobFile(bf.join("./results", filename), "wb") as f:
-                th.save(state_dict, f)
+        step = f"{(self.step + self.resume_step):06d}"
+        # main
+        torch.save(self.model.state_dict(), f"./results/model{step}.pt")
+        # EMA
+        for rate, ema_model in zip(self.ema_rate, self.ema_models):
+            torch.save(ema_model.state_dict(), f"./results/ema_{rate}_{step}.pt")
+        # optimizer
+        torch.save(self.opt.state_dict(), f"./results/opt{step}.pt")
 
-        save_checkpoint(0, self.mp_trainer.master_params)
-        for rate, params in zip(self.ema_rate, self.ema_params):
-            save_checkpoint(rate, params)
-
-        # TODO
-        with bf.BlobFile(
-            bf.join("./results", f"opt{(self.step + self.resume_step):06d}.pt"),
-            "wb",
-        ) as f:
-            th.save(self.opt.state_dict(), f)
-
-    def sanity_test(self, batch, device, cond):
+    def sanity_test(
+        self, batch: torch.Tensor, device: str, cond: dict[str, torch.Tensor]
+    ):
         self.model.eval()
         x = torch.randn_like(batch, device=device)
         cond = {k: v.to(device) for k, v in cond.items()}
@@ -238,7 +229,7 @@ class TrainLoop:
             grayscale=self.grayscale,
         )
 
-    def preprocess_input(self, data: dict[str, torch.Tensor | str]):
+    def preprocess_input(self, data: dict[str, torch.Tensor]):
         # move to GPU and change data types
         data["label"] = data["label"].long()
 
@@ -249,12 +240,6 @@ class TrainLoop:
         input_label = th.FloatTensor(bs, nc, h, w).zero_()
         input_semantics = input_label.scatter_(1, label_map, 1.0)
 
-        # concatenate instance map if it exists
-        if "instance" in data:
-            inst_map = data["instance"]
-            instance_edge_map = self.get_edges(inst_map)
-            input_semantics = th.cat((input_semantics, instance_edge_map), dim=1)
-
         if self.drop_rate > 0.0:
             mask = (
                 th.rand([input_semantics.shape[0], 1, 1, 1]) > self.drop_rate
@@ -264,29 +249,21 @@ class TrainLoop:
         cond = {
             key: value
             for key, value in data.items()
-            if key not in ["label", "instance", "path", "label_ori"]
+            if key not in ["label", "path", "label_ori"]
         }
         cond["y"] = input_semantics
 
         return cond
 
-    def get_edges(self, t):
-        edge = th.ByteTensor(t.size()).zero_()
-        edge[:, :, :, 1:] = edge[:, :, :, 1:] | (t[:, :, :, 1:] != t[:, :, :, :-1])
-        edge[:, :, :, :-1] = edge[:, :, :, :-1] | (t[:, :, :, 1:] != t[:, :, :, :-1])
-        edge[:, :, 1:, :] = edge[:, :, 1:, :] | (t[:, :, 1:, :] != t[:, :, :-1, :])
-        edge[:, :, :-1, :] = edge[:, :, :-1, :] | (t[:, :, 1:, :] != t[:, :, :-1, :])
-        return edge.float()
-
 
 class UniformSampler:
-    def __init__(self, diffusion_steps):
+    def __init__(self, diffusion_steps: int):
         self._weights = np.ones([diffusion_steps])
 
     def weights(self):
         return self._weights
 
-    def sample(self, batch_size, device):
+    def sample(self, batch_size: int, device: str):
         """
         Importance-sample timesteps for a batch.
 
@@ -305,28 +282,25 @@ class UniformSampler:
         return indices, weights
 
 
-def parse_resume_step_from_filename(filename):
+def parse_resume_step_from_filename(filename: Path | None):
     """
     Parse filenames of the form path/to/modelNNNNNN.pt, where NNNNNN is the
     checkpoint's number of steps.
     """
-    split = filename.split("model")
-    if len(split) < 2:
+    if filename is None:
         return 0
-    split1 = split[-1].split(".")[0]
+    if not filename.exists():
+        return 0
+    step = filename.stem.replace("model", "")
     try:
-        return int(split1)
+        return int(step)
     except ValueError:
         return 0
 
 
-def find_resume_checkpoint():
-    # On your infrastructure, you may want to override this to automatically
-    # discover the latest checkpoint on your blob storage, etc.
-    return None
-
-
-def find_ema_checkpoint(main_checkpoint, step, rate):
+def find_ema_checkpoint(
+    main_checkpoint: Path | None, step: int, rate: str
+) -> Path | None:
     if main_checkpoint is None:
         return None
     filename = f"ema_{rate}_{(step):06d}.pt"

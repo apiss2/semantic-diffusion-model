@@ -19,7 +19,6 @@ class TrainConfig(BaseModel):
     batch_size: int | None = None
     num_classes: int | None = None
     num_train_timesteps: int | None = None
-    use_fp16: bool | None = None
     grayscale: bool | None = None
     # 他設定の定義
     lr: float = 1e-4
@@ -28,6 +27,7 @@ class TrainConfig(BaseModel):
     lr_anneal_steps: int = 50000
     save_interval: int = 5000
     resume_checkpoint: str = ""
+    use_fp16: bool = True
     fp16_scale_growth: float = 1e-2
     drop_rate: float = 0.0
 
@@ -36,7 +36,6 @@ class ModelConfig(BaseModel):
     # 複数の設定に跨る値を定義
     image_size: int | None = None
     num_classes: int | None = None
-    use_fp16: bool | None = None
     # 他設定の定義
     num_channels: int = 128
     num_res_blocks: int = 2
@@ -69,7 +68,6 @@ class Config(BaseSettings):
     batch_size: int = Field(8)
     num_classes: int = Field(19)
     num_train_timesteps: int = Field(1000)
-    use_fp16: bool = Field(True)
     grayscale: bool = Field(False)
 
     train: TrainConfig = TrainConfig()
@@ -92,7 +90,6 @@ class Config(BaseSettings):
             "image_size": ("dataset", "model"),
             "batch_size": ("dataset", "train"),
             "num_classes": ("dataset", "train", "model"),
-            "use_fp16": ("train", "model"),
             "grayscale": ("dataset", "train"),
             "num_train_timesteps": ("scheduler", "train"),
         }

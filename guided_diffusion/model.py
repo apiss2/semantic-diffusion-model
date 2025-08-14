@@ -6,22 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Iterator
-
-from .fp16_util import convert_module_to_f16, convert_module_to_f32
+import torch.utils.checkpoint as cp
 
 
 # PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
 class SiLU(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(x)
-
-
-class GroupNorm32(nn.GroupNorm):
-    def __init__(self, num_channels, eps=0.00001, affine=True, device=None, dtype=None):
-        super().__init__(32, num_channels, eps, affine, device, dtype)
-
-    def forward(self, x):
-        return super().forward(x.float()).type(x.dtype)
 
 
 def conv_nd(dims, *args, **kwargs):
@@ -97,55 +88,6 @@ def timestep_embedding(timesteps, dim, max_period=10000):
     if dim % 2:
         embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     return embedding
-
-
-def checkpoint(func, inputs, params, flag):
-    """
-    Evaluate a function without caching intermediate activations, allowing for
-    reduced memory at the expense of extra compute in the backward pass.
-
-    :param func: the function to evaluate.
-    :param inputs: the argument sequence to pass to `func`.
-    :param params: a sequence of parameters `func` depends on but does not
-                   explicitly take as arguments.
-    :param flag: if False, disable gradient checkpointing.
-    """
-    if flag:
-        args = tuple(inputs) + tuple(params)
-        return CheckpointFunction.apply(func, len(inputs), *args)
-    else:
-        return func(*inputs)
-
-
-class CheckpointFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, run_function, length, *args):
-        ctx.run_function = run_function
-        ctx.input_tensors = list(args[:length])
-        ctx.input_params = list(args[length:])
-        with torch.no_grad():
-            output_tensors = ctx.run_function(*ctx.input_tensors)
-        return output_tensors
-
-    @staticmethod
-    def backward(ctx, *output_grads):
-        ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
-        with torch.enable_grad():
-            # Fixes a bug where the first op in run_function modifies the
-            # Tensor storage in place, which is not allowed for detach()'d
-            # Tensors.
-            shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
-            output_tensors = ctx.run_function(*shallow_copies)
-        input_grads = torch.autograd.grad(
-            output_tensors,
-            ctx.input_tensors + ctx.input_params,
-            output_grads,
-            allow_unused=True,
-        )
-        del ctx.input_tensors
-        del ctx.input_params
-        del output_tensors
-        return (None, None) + input_grads
 
 
 class TimestepBlock(nn.Module):
@@ -319,7 +261,7 @@ class ResBlock(TimestepBlock):
         self.use_scale_shift_norm = use_scale_shift_norm
 
         self.in_layers = nn.Sequential(
-            GroupNorm32(channels),
+            nn.GroupNorm(32, channels),
             SiLU(),
             conv_nd(dims, channels, self.out_channels, 3, padding=1),
         )
@@ -343,7 +285,7 @@ class ResBlock(TimestepBlock):
             ),
         )
         self.out_layers = nn.Sequential(
-            GroupNorm32(self.out_channels),
+            nn.GroupNorm(32, self.out_channels),
             SiLU(),
             nn.Dropout(p=dropout),
             zero_module(
@@ -368,9 +310,10 @@ class ResBlock(TimestepBlock):
         :param emb: an [N x emb_channels] Tensor of timestep embeddings.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        return checkpoint(
-            self._forward, (x, emb), self.parameters(), self.use_checkpoint
-        )
+        if self.use_checkpoint:
+            return cp.checkpoint(self._forward, x, emb, use_reentrant=False)
+        else:
+            return self._forward(x, emb)
 
     def _forward(self, x, emb):
         if self.updown:
@@ -381,7 +324,7 @@ class ResBlock(TimestepBlock):
             h = in_conv(h)
         else:
             h = self.in_layers(x)
-        emb_out = self.emb_layers(emb).type(h.dtype)
+        emb_out = self.emb_layers(emb)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
         if self.use_scale_shift_norm:
@@ -485,9 +428,10 @@ class SDMResBlock(CondTimestepBlock):
         :param emb: an [N x emb_channels] Tensor of timestep embeddings.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        return checkpoint(
-            self._forward, (x, cond, emb), self.parameters(), self.use_checkpoint
-        )
+        if self.use_checkpoint:
+            return cp.checkpoint(self._forward, x, cond, emb, use_reentrant=False)
+        else:
+            return self._forward(x, cond, emb)
 
     def _forward(self, x, cond, emb):
         if self.updown:
@@ -500,7 +444,7 @@ class SDMResBlock(CondTimestepBlock):
         else:
             h = self.in_norm(x, cond)
             h = self.in_layers(h)
-        emb_out = self.emb_layers(emb).type(h.dtype)
+        emb_out = self.emb_layers(emb)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
         if self.use_scale_shift_norm:
@@ -539,7 +483,7 @@ class AttentionBlock(nn.Module):
             )
             self.num_heads = channels // num_head_channels
         self.use_checkpoint = use_checkpoint
-        self.norm = GroupNorm32(channels)
+        self.norm = nn.GroupNorm(32, channels)
         self.qkv = conv_nd(1, channels, channels * 3, 1)
         # split qkv before split heads
         self.attention = QKVAttention(self.num_heads)
@@ -547,7 +491,10 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)
+        if self.use_checkpoint:
+            return cp.checkpoint(self._forward, x, use_reentrant=False)
+        else:
+            return self._forward(x)
 
     def _forward(self, x):
         b, c, *spatial = x.shape
@@ -604,7 +551,7 @@ class QKVAttention(nn.Module):
             (q * scale).view(bs * self.n_heads, ch, length),
             (k * scale).view(bs * self.n_heads, ch, length),
         )  # More stable with f16 than dividing afterwards
-        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        weight = torch.softmax(weight.float(), dim=-1)
         a = torch.einsum(
             "bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length)
         )
@@ -658,7 +605,6 @@ class UNetModel(nn.Module):
         dims=2,
         num_classes=None,
         use_checkpoint=False,
-        use_fp16=False,
         num_heads=1,
         num_head_channels=-1,
         num_heads_upsample=-1,
@@ -681,7 +627,6 @@ class UNetModel(nn.Module):
         self.conv_resample = conv_resample
         self.num_classes = num_classes
         self.use_checkpoint = use_checkpoint
-        self.dtype = torch.float16 if use_fp16 else torch.float32
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
@@ -827,26 +772,10 @@ class UNetModel(nn.Module):
                 self._feature_size += ch
 
         self.out = nn.Sequential(
-            GroupNorm32(ch),
+            nn.GroupNorm(32, ch),
             SiLU(),
             zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
         )
-
-    def convert_to_fp16(self):
-        """
-        Convert the torso of the model to float16.
-        """
-        self.input_blocks.apply(convert_module_to_f16)
-        self.middle_block.apply(convert_module_to_f16)
-        self.output_blocks.apply(convert_module_to_f16)
-
-    def convert_to_fp32(self):
-        """
-        Convert the torso of the model to float32.
-        """
-        self.input_blocks.apply(convert_module_to_f32)
-        self.middle_block.apply(convert_module_to_f32)
-        self.output_blocks.apply(convert_module_to_f32)
 
     def forward(self, x, timesteps, y=None):
         """
@@ -867,8 +796,7 @@ class UNetModel(nn.Module):
         if self.num_classes is not None:
             assert y.shape == (x.shape[0], self.num_classes, x.shape[2], x.shape[3])
 
-        y = y.type(self.dtype)
-        h = x.type(self.dtype)
+        h = x
         for module in self.input_blocks:
             h = module(h, y, emb)
             hs.append(h)
@@ -876,5 +804,4 @@ class UNetModel(nn.Module):
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
             h = module(h, y, emb)
-        h = h.type(x.dtype)
         return self.out(h)
