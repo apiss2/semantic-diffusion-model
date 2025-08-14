@@ -1,13 +1,10 @@
 import copy
-import os
 from pathlib import Path
 from typing import Iterator
 
-import blobfile as bf
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch as th
 from diffusers.schedulers import DDPMScheduler
 from torch.amp import GradScaler
 from torch.optim import AdamW
@@ -17,11 +14,6 @@ from tqdm import tqdm
 from .losses import vb_terms_bits_per_dim
 from .model import UNetModel, update_ema
 
-# For ImageNet experiments, this was a good default value.
-# We found that the lg_loss_scale quickly climbed to
-# 20-21 within the first ~1K steps of training.
-INITIAL_LOG_LOSS_SCALE = 20.0
-
 
 class TrainLoop:
     def __init__(
@@ -29,6 +21,7 @@ class TrainLoop:
         model: UNetModel,
         scheduler: DDPMScheduler,
         data: Iterator[DataLoader],
+        save_dir: Path,
         num_classes: int,
         batch_size: int,
         lr: float,
@@ -46,6 +39,7 @@ class TrainLoop:
         self.model: UNetModel = model
         self.scheduler: DDPMScheduler = scheduler
         self.data = data
+        self.save_dir = save_dir
         self.num_classes = num_classes
         self.batch_size = batch_size
         self.lr = lr
@@ -56,7 +50,9 @@ class TrainLoop:
         )
         self.drop_rate = drop_rate
         self.save_interval = save_interval
-        self.resume_checkpoint = Path(resume_checkpoint) if resume_checkpoint else None
+        self.resume_checkpoint = (
+            Path(resume_checkpoint) if resume_checkpoint != "" else None
+        )
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
         self.schedule_sampler = UniformSampler(num_train_timesteps)
@@ -89,7 +85,7 @@ class TrainLoop:
     def _load_checkpoint(self):
         if self.resume_checkpoint:
             self.resume_step = parse_resume_step_from_filename(self.resume_checkpoint)
-            self.model.load_state_dict(th.load(self.resume_checkpoint))
+            self.model.load_state_dict(torch.load(self.resume_checkpoint))
 
     def _load_ema_model(self, rate):
         ema_checkpoint = find_ema_checkpoint(
@@ -97,19 +93,18 @@ class TrainLoop:
         )
         if ema_checkpoint:
             model = copy.deepcopy(self.model)
-            state_dict = th.load(ema_checkpoint)
+            state_dict = torch.load(ema_checkpoint)
             ema_model = model.load_state_dict(state_dict)
             return ema_model
         else:
             None
 
     def _load_optimizer_state(self):
-        opt_checkpoint = bf.join(
-            bf.dirname(self.resume_checkpoint), f"opt{self.resume_step:06}.pt"
-        )
-        if bf.exists(opt_checkpoint):
-            self.opt.load_state_dict(th.load(opt_checkpoint))
-
+        if self.resume_checkpoint:
+            name = f"ckpt/opt{self.resume_step:06}.pt"
+            opt_checkpoint = self.save_dir / name
+            assert opt_checkpoint.exists()
+            self.opt.load_state_dict(torch.load(opt_checkpoint))
             if self.opt.param_groups[0]["lr"] != self.lr:
                 self.opt.param_groups[0]["lr"] = self.lr
 
@@ -125,7 +120,7 @@ class TrainLoop:
                 self.save()
                 self.sanity_test(batch=batch, device="cuda", cond=cond)
                 # Run for a finite amount of time in integration tests.
-                if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
+                if self.step > 0:
                     return
             self.step += 1
         # Save the last checkpoint if it wasn't already saved.
@@ -142,7 +137,7 @@ class TrainLoop:
         x_t = self.scheduler.add_noise(batch, noise, t)
 
         # AMP
-        autocast_dtype = torch.float16 if self.use_fp16 else torch.float32
+        autocast_dtype = torch.bfloat16 if self.use_fp16 else torch.float32
         with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=True):
             model_out = self.model(x_t, t, y=cond["y"])  # 2C 出力は現状維持
             eps_pred, var_raw = torch.split(model_out, batch.shape[1], dim=1)
@@ -187,13 +182,15 @@ class TrainLoop:
 
     def save(self):
         step = f"{(self.step + self.resume_step):06d}"
+        sd = self.save_dir / "ckpt"
+        sd.mkdir(exist_ok=True)
         # main
-        torch.save(self.model.state_dict(), f"./results/model{step}.pt")
+        torch.save(self.model.state_dict(), sd / f"model{step}.pt")
         # EMA
         for rate, ema_model in zip(self.ema_rate, self.ema_models):
-            torch.save(ema_model.state_dict(), f"./results/ema_{rate}_{step}.pt")
+            torch.save(ema_model.state_dict(), sd / f"ema_{rate}_{step}.pt")
         # optimizer
-        torch.save(self.opt.state_dict(), f"./results/opt{step}.pt")
+        torch.save(self.opt.state_dict(), sd / f"opt{step}.pt")
 
     def sanity_test(
         self, batch: torch.Tensor, device: str, cond: dict[str, torch.Tensor]
@@ -205,7 +202,7 @@ class TrainLoop:
         snapshot_names = ["25%", "50%", "75%"]
         snapshot_steps = [total_steps // 4 * i for i in range(1, 4)]
         snapshots = dict()
-        with th.no_grad():
+        with torch.no_grad():
             total = len(self.scheduler.timesteps)
             for i, t in tqdm(enumerate(self.scheduler.timesteps), total=total):
                 t_batch = torch.tensor([t] * x.shape[0], device=device)  # shape = [B]
@@ -224,7 +221,7 @@ class TrainLoop:
             inference_img=inference_img,
             src_img=src_img,
             snapshots=snapshots,
-            output_dir="./results",
+            output_dir=self.save_dir / "snapshots",
             step=self.step,
             grayscale=self.grayscale,
         )
@@ -237,19 +234,17 @@ class TrainLoop:
         label_map = data["label"]
         bs, _, h, w = label_map.size()
         nc = self.num_classes
-        input_label = th.FloatTensor(bs, nc, h, w).zero_()
+        input_label = torch.FloatTensor(bs, nc, h, w).zero_()
         input_semantics = input_label.scatter_(1, label_map, 1.0)
 
         if self.drop_rate > 0.0:
             mask = (
-                th.rand([input_semantics.shape[0], 1, 1, 1]) > self.drop_rate
+                torch.rand([input_semantics.shape[0], 1, 1, 1]) > self.drop_rate
             ).float()
             input_semantics = input_semantics * mask
 
         cond = {
-            key: value
-            for key, value in data.items()
-            if key not in ["label", "path", "label_ori"]
+            key: value for key, value in data.items() if key not in ["label", "path"]
         }
         cond["y"] = input_semantics
 
@@ -304,8 +299,8 @@ def find_ema_checkpoint(
     if main_checkpoint is None:
         return None
     filename = f"ema_{rate}_{(step):06d}.pt"
-    path = bf.join(bf.dirname(main_checkpoint), filename)
-    if bf.exists(path):
+    path = main_checkpoint.parent.joinpath(filename)
+    if path.exists():
         return path
     return None
 
@@ -314,10 +309,11 @@ def log_images(
     inference_img: torch.Tensor,
     src_img: torch.Tensor,
     snapshots: dict[str, torch.Tensor],
-    output_dir: str,
+    output_dir: Path,
     step: int,
     grayscale: bool,
 ):
+    output_dir.mkdir(exist_ok=True)
     num_rows = 2 + len(snapshots)
     num_cols = inference_img.shape[0]
     base_width = 4
@@ -353,5 +349,5 @@ def log_images(
         axs[i + 2, 0].set_title(f"Snapshot {snap}")
 
     plt.tight_layout(rect=[0, 0.0, 1, 0.95])
-    plt.savefig(f"{output_dir}/diffusion_results_{str(step).zfill(6)}.png")
+    plt.savefig(output_dir / f"{str(step).zfill(6)}.png")
     plt.close()

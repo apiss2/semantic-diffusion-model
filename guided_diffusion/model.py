@@ -593,37 +593,40 @@ class UNetModel(nn.Module):
 
     def __init__(
         self,
-        image_size,
-        in_channels,
-        model_channels,
-        out_channels,
-        num_res_blocks,
-        attention_resolutions,
-        dropout=0,
-        channel_mult=(1, 2, 4, 8),
-        conv_resample=True,
-        dims=2,
-        num_classes=None,
-        use_checkpoint=False,
-        num_heads=1,
-        num_head_channels=-1,
-        num_heads_upsample=-1,
-        use_scale_shift_norm=False,
-        resblock_updown=False,
+        image_size: int,
+        model_channels: int,
+        num_res_blocks: int,
+        attention_resolutions: str,
+        dropout: float = 0.0,
+        channel_mult: str = "",
+        conv_resample: bool = True,
+        dims: int = 2,
+        num_classes: int | None = None,
+        use_checkpoint: bool = False,
+        num_heads: int = 1,
+        num_head_channels: int = -1,
+        num_heads_upsample: int = -1,
+        use_scale_shift_norm: bool = False,
+        resblock_updown: bool = False,
+        grayscale: bool = False,
     ):
         super().__init__()
 
         if num_heads_upsample == -1:
             num_heads_upsample = num_heads
 
+        attention_ds = []
+        for res in attention_resolutions.split(","):
+            attention_ds.append(image_size // int(res))
+
         self.image_size = image_size
-        self.in_channels = in_channels
+        self.in_channels = 1 if grayscale else 3
         self.model_channels = model_channels
-        self.out_channels = out_channels
+        self.out_channels = 2 if grayscale else 6
         self.num_res_blocks = num_res_blocks
-        self.attention_resolutions = attention_resolutions
+        self.attention_resolutions = tuple(attention_ds)
         self.dropout = dropout
-        self.channel_mult = channel_mult
+        self.channel_mult = get_channel_mult(channel_mult, image_size)
         self.conv_resample = conv_resample
         self.num_classes = num_classes
         self.use_checkpoint = use_checkpoint
@@ -638,14 +641,14 @@ class UNetModel(nn.Module):
             nn.Linear(time_embed_dim, time_embed_dim),
         )
 
-        ch = input_ch = int(channel_mult[0] * model_channels)
+        ch = input_ch = int(self.channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
-            [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
+            [TimestepEmbedSequential(conv_nd(dims, self.in_channels, ch, 3, padding=1))]
         )
         self._feature_size = ch
         input_block_chans = [ch]
         ds = 1
-        for level, mult in enumerate(channel_mult):
+        for level, mult in enumerate(self.channel_mult):
             for _ in range(num_res_blocks):
                 layers = [
                     ResBlock(
@@ -659,7 +662,7 @@ class UNetModel(nn.Module):
                     )
                 ]
                 ch = int(mult * model_channels)
-                if ds in attention_resolutions:
+                if ds in self.attention_resolutions:
                     layers.append(
                         AttentionBlock(
                             ch,
@@ -671,7 +674,7 @@ class UNetModel(nn.Module):
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
                 self._feature_size += ch
                 input_block_chans.append(ch)
-            if level != len(channel_mult) - 1:
+            if level != len(self.channel_mult) - 1:
                 out_ch = ch
                 self.input_blocks.append(
                     TimestepEmbedSequential(
@@ -725,7 +728,7 @@ class UNetModel(nn.Module):
         self._feature_size += ch
 
         self.output_blocks = nn.ModuleList([])
-        for level, mult in list(enumerate(channel_mult))[::-1]:
+        for level, mult in list(enumerate(self.channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
                 ich = input_block_chans.pop()
                 layers = [
@@ -741,7 +744,7 @@ class UNetModel(nn.Module):
                     )
                 ]
                 ch = int(model_channels * mult)
-                if ds in attention_resolutions:
+                if ds in self.attention_resolutions:
                     layers.append(
                         AttentionBlock(
                             ch,
@@ -774,7 +777,7 @@ class UNetModel(nn.Module):
         self.out = nn.Sequential(
             nn.GroupNorm(32, ch),
             SiLU(),
-            zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
+            zero_module(conv_nd(dims, input_ch, self.out_channels, 3, padding=1)),
         )
 
     def forward(self, x, timesteps, y=None):
@@ -805,3 +808,19 @@ class UNetModel(nn.Module):
             h = torch.cat([h, hs.pop()], dim=1)
             h = module(h, y, emb)
         return self.out(h)
+
+
+def get_channel_mult(channel_mult: str, image_size: int):
+    if channel_mult == "":
+        if image_size == 512:
+            return (0.5, 1, 1, 2, 2, 4, 4)
+        elif image_size == 256:
+            return (1, 1, 2, 2, 4, 4)
+        elif image_size == 128:
+            return (1, 1, 2, 3, 4)
+        elif image_size == 64:
+            return (1, 2, 3, 4)
+        else:
+            raise ValueError(f"unsupported image size: {image_size}")
+    else:
+        return tuple(int(ch_mult) for ch_mult in channel_mult.split(","))

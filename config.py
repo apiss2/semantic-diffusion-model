@@ -37,7 +37,7 @@ class ModelConfig(BaseModel):
     image_size: int | None = None
     num_classes: int | None = None
     # 他設定の定義
-    num_channels: int = 128
+    model_channels: int = 128
     num_res_blocks: int = 2
     num_heads: int = 1
     num_head_channels: int = 64
@@ -45,11 +45,9 @@ class ModelConfig(BaseModel):
     attention_resolutions: str = "32,16,8"
     channel_mult: str = ""
     dropout: float = 0.0
-    class_cond: bool = True
     use_checkpoint: bool = True
     use_scale_shift_norm: bool = True
     resblock_updown: bool = True
-    no_instance: bool = True
 
 
 class SchedulerConfig(BaseModel):
@@ -63,6 +61,8 @@ class SchedulerConfig(BaseModel):
 
 
 class Config(BaseSettings):
+    save_dir_root: str = "./results/"
+
     # 複数の設定に跨る値を定義
     image_size: int = Field(128)
     batch_size: int = Field(8)
