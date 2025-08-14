@@ -18,6 +18,7 @@ class TrainConfig(BaseModel):
     # 複数の設定に跨る値を定義
     batch_size: int | None = None
     num_classes: int | None = None
+    num_train_timesteps: int | None = None
     use_fp16: bool | None = None
     grayscale: bool | None = None
     # 他設定の定義
@@ -25,7 +26,7 @@ class TrainConfig(BaseModel):
     ema_rate: str = "0.9,0.99"  # comma-separated list of EMA values
     weight_decay: float = 1e-3
     lr_anneal_steps: int = 50000
-    save_interval: int = 1000
+    save_interval: int = 5000
     resume_checkpoint: str = ""
     fp16_scale_growth: float = 1e-2
     drop_rate: float = 0.0
@@ -52,24 +53,29 @@ class ModelConfig(BaseModel):
     no_instance: bool = True
 
 
-class DiffusionConfig(BaseModel):
-    diffusion_steps: int = 1000
-    noise_schedule: str = "linear"
-    timestep_respacing: str = ""
+class SchedulerConfig(BaseModel):
+    # 複数の設定に跨る値を定義
+    num_train_timesteps: int | None = None
+    # 他設定の定義
+    beta_schedule: str = "squaredcos_cap_v2"  # 他squaredcos_cap_v2等
+    prediction_type: str = "epsilon"  # ε予測
+    variance_type: str = "learned_range"  # 分散は[-1,1]→[min_log,max_log]補間
+    clip_sample: bool = True
 
 
 class Config(BaseSettings):
     # 複数の設定に跨る値を定義
     image_size: int = Field(128)
-    batch_size: int = Field(4)
+    batch_size: int = Field(8)
     num_classes: int = Field(19)
+    num_train_timesteps: int = Field(1000)
     use_fp16: bool = Field(True)
     grayscale: bool = Field(False)
 
     train: TrainConfig = TrainConfig()
     dataset: DatasetConfig = DatasetConfig()
     model: ModelConfig = ModelConfig()
-    diffusion: DiffusionConfig = DiffusionConfig()
+    scheduler: SchedulerConfig = SchedulerConfig()
 
     class Config:
         env_nested_delimiter = "__"
@@ -88,6 +94,7 @@ class Config(BaseSettings):
             "num_classes": ("dataset", "train", "model"),
             "use_fp16": ("train", "model"),
             "grayscale": ("dataset", "train"),
+            "num_train_timesteps": ("scheduler", "train"),
         }
 
         for key, sections in shared_map.items():

@@ -1,5 +1,4 @@
 import copy
-import functools
 import os
 
 import blobfile as bf
@@ -7,10 +6,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch as th
+from diffusers.schedulers import DDPMScheduler
 from torch.optim import AdamW
+from tqdm import tqdm
 
 from .fp16_util import MixedPrecisionTrainer
-from .gaussian_diffusion import GaussianDiffusion
+from .losses import vb_terms_bits_per_dim
 from .model import UNetModel, update_ema
 
 # For ImageNet experiments, this was a good default value.
@@ -22,9 +23,8 @@ INITIAL_LOG_LOSS_SCALE = 20.0
 class TrainLoop:
     def __init__(
         self,
-        *,
-        model,
-        diffusion,
+        model: UNetModel,
+        scheduler: DDPMScheduler,
         data,
         num_classes,
         batch_size,
@@ -33,6 +33,7 @@ class TrainLoop:
         drop_rate,
         save_interval,
         resume_checkpoint,
+        num_train_timesteps=1000,
         use_fp16=False,
         fp16_scale_growth=1e-3,
         weight_decay=0.0,
@@ -40,7 +41,7 @@ class TrainLoop:
         grayscale=False,
     ):
         self.model: UNetModel = model
-        self.diffusion: GaussianDiffusion = diffusion
+        self.scheduler: DDPMScheduler = scheduler
         self.data = data
         self.num_classes = num_classes
         self.batch_size = batch_size
@@ -55,7 +56,7 @@ class TrainLoop:
         self.resume_checkpoint = resume_checkpoint
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
-        self.schedule_sampler = UniformSampler(diffusion)
+        self.schedule_sampler = UniformSampler(num_train_timesteps)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
         self.grayscale = grayscale
@@ -144,30 +145,31 @@ class TrainLoop:
 
     def forward_backward(self, batch, cond):
         self.mp_trainer.zero_grad()
-        for i in range(0, batch.shape[0], self.batch_size):
-            micro = batch[i : i + self.batch_size].to("cuda")
-            micro_cond = {
-                k: v[i : i + self.batch_size].to("cuda") for k, v in cond.items()
-            }
-            last_batch = (i + self.batch_size) >= batch.shape[0]
-            t, weights = self.schedule_sampler.sample(micro.shape[0], "cuda")
+        batch = batch.to("cuda")
+        cond = {k: v.to("cuda") for k, v in cond.items()}
+        t, weights = self.schedule_sampler.sample(batch.shape[0], "cuda")
+        noise = torch.randn_like(batch, device="cuda")
+        x_t = self.scheduler.add_noise(batch, noise, t)
 
-            compute_losses = functools.partial(
-                self.diffusion.training_losses,
-                self.model,
-                micro,
-                t,
-                model_kwargs=micro_cond,
-            )
+        # モデル前向き（2*C 出力は現状維持）
+        model_out = self.model(x_t, t, y=cond["y"])
+        eps_pred, var_raw = torch.split(model_out, batch.shape[1], dim=1)
 
-            if last_batch or not self.use_ddp:
-                losses = compute_losses()
-            else:
-                with self.model.no_sync():
-                    losses = compute_losses()
+        # ====== MSE(ε) ======
+        mse = ((noise - eps_pred) ** 2).mean(dim=(1, 2, 3))  # mean_flat と同等
 
-            loss = (losses["loss"] * weights).mean()
-            self.mp_trainer.backward(loss)
+        # ====== VB 項（KL or NLL@t=0） ======
+        vb = vb_terms_bits_per_dim(
+            scheduler=self.scheduler,
+            x_start=batch,
+            x_t=x_t,
+            t=t,
+            eps_pred_detached=eps_pred.detach(),  # meanには勾配を流さない
+            var_raw=var_raw,
+        )
+
+        loss = ((mse + vb) * weights).mean()
+        self.mp_trainer.backward(loss)
         print(f"\rstep: {self.step} | loss: {loss.detach().cpu().numpy():.4f}", end="")
 
     def _update_ema(self):
@@ -205,20 +207,28 @@ class TrainLoop:
             th.save(self.opt.state_dict(), f)
 
     def sanity_test(self, batch, device, cond):
-        src_img = ((batch + 1.0) / 2.0).to(device)
-        model_kwargs = cond
-
+        self.model.eval()
+        x = torch.randn_like(batch, device=device)
+        cond = {k: v.to(device) for k, v in cond.items()}
+        total_steps = len(self.scheduler.timesteps)
+        snapshot_names = ["25%", "50%", "75%"]
+        snapshot_steps = [total_steps // 4 * i for i in range(1, 4)]
+        snapshots = dict()
         with th.no_grad():
-            self.model.eval()
-            inference_img, snapshots = self.diffusion.p_sample_loop_with_snapshot(
-                self.model,
-                (batch.shape[0], 3, batch.shape[2], batch.shape[3]),
-                model_kwargs=model_kwargs,
-                progress=True,
-            )
-            self.model.train()
+            total = len(self.scheduler.timesteps)
+            for i, t in tqdm(enumerate(self.scheduler.timesteps), total=total):
+                t_batch = torch.tensor([t] * x.shape[0], device=device)  # shape = [B]
+                model_out = self.model(x, t_batch, y=cond["y"])  # 2C出力
+                x_prev = self.scheduler.step(model_out, t, x).prev_sample
+                # snapshot 用に x_prev を保存
+                if i in snapshot_steps:
+                    idx = snapshot_steps.index(i)
+                    snapshots[snapshot_names[idx]] = (x_prev + 1) / 2.0
+                x = x_prev
+        self.model.train()
 
-        inference_img = (inference_img + 1) / 2.0
+        src_img = ((batch + 1.0) / 2.0).to(device)
+        inference_img = (x + 1) / 2.0
         log_images(
             inference_img=inference_img,
             src_img=src_img,
@@ -228,7 +238,7 @@ class TrainLoop:
             grayscale=self.grayscale,
         )
 
-    def preprocess_input(self, data):
+    def preprocess_input(self, data: dict[str, torch.Tensor | str]):
         # move to GPU and change data types
         data["label"] = data["label"].long()
 
@@ -270,9 +280,8 @@ class TrainLoop:
 
 
 class UniformSampler:
-    def __init__(self, diffusion):
-        self.diffusion = diffusion
-        self._weights = np.ones([diffusion.num_timesteps])
+    def __init__(self, diffusion_steps):
+        self._weights = np.ones([diffusion_steps])
 
     def weights(self):
         return self._weights
@@ -327,7 +336,14 @@ def find_ema_checkpoint(main_checkpoint, step, rate):
     return None
 
 
-def log_images(inference_img, src_img, snapshots, output_dir, step, grayscale):
+def log_images(
+    inference_img: torch.Tensor,
+    src_img: torch.Tensor,
+    snapshots: dict[str, torch.Tensor],
+    output_dir: str,
+    step: int,
+    grayscale: bool,
+):
     num_rows = 2 + len(snapshots)
     num_cols = inference_img.shape[0]
     base_width = 4
@@ -338,18 +354,23 @@ def log_images(inference_img, src_img, snapshots, output_dir, step, grayscale):
     fig, axs = plt.subplots(num_rows, num_cols, figsize=(fig_width, fig_height))
     fig.suptitle("Diffusion Model Results", fontsize=16)
 
+    src_img = src_img.cpu().detach().numpy().transpose(0, 2, 3, 1)
+    inference_img = inference_img.cpu().detach().numpy().transpose(0, 2, 3, 1)
+    c = 1 if grayscale else 3
+    src_img = np.clip(src_img[..., :c], 0, 1)
+    inference_img = np.clip(inference_img[..., :c], 0, 1)
+
     kwargs = dict(cmap="gray") if grayscale else dict()
     for k in range(num_cols):
-        axs[0, k].imshow(src_img[k, 0, ...].cpu().detach().numpy(), **kwargs)
+        axs[0, k].imshow(src_img[k], **kwargs)
         axs[0, k].axis("off")
 
-        axs[1, k].imshow(inference_img[k, 0, ...].cpu().detach().numpy(), **kwargs)
+        axs[1, k].imshow(inference_img[k], **kwargs)
         axs[1, k].axis("off")
 
-        for i, snap in enumerate(snapshots):
-            axs[i + 2, k].imshow(
-                snapshots[snap][k, 0, ...].cpu().detach().numpy(), **kwargs
-            )
+        for i, snap in enumerate(snapshots.values()):
+            tmp = np.clip(snap[k, :c, ...].cpu().detach().numpy(), 0, 1)
+            axs[i + 2, k].imshow(tmp.transpose(1, 2, 0), **kwargs)
             axs[i + 2, k].axis("off")
 
     axs[0, 0].set_title("Source Image")
