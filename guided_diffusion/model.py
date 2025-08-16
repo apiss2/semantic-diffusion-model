@@ -609,6 +609,7 @@ class UNetModel(nn.Module):
         use_scale_shift_norm: bool = False,
         resblock_updown: bool = False,
         grayscale: bool = False,
+        predict_sigma: bool = False,
     ):
         super().__init__()
 
@@ -622,7 +623,9 @@ class UNetModel(nn.Module):
         self.image_size = image_size
         self.in_channels = 1 if grayscale else 3
         self.model_channels = model_channels
-        self.out_channels = 2 if grayscale else 6
+        self.out_channels = self.in_channels
+        if predict_sigma:
+            self.out_channels *= 2
         self.num_res_blocks = num_res_blocks
         self.attention_resolutions = tuple(attention_ds)
         self.dropout = dropout
@@ -633,6 +636,7 @@ class UNetModel(nn.Module):
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
+        self.predict_sigma = predict_sigma
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(

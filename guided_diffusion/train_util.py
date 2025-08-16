@@ -143,19 +143,20 @@ class TrainLoop:
             eps_pred, var_raw = torch.split(model_out, batch.shape[1], dim=1)
 
             # ====== MSE(ε) ======
-            mse = ((noise - eps_pred) ** 2).mean(dim=(1, 2, 3))  # mean_flat と同等
+            loss = ((noise - eps_pred) ** 2).mean(dim=(1, 2, 3))  # mean_flat と同等
 
             # ====== VB 項（KL or NLL@t=0） ======
-            vb = vb_terms_bits_per_dim(
-                scheduler=self.scheduler,
-                x_start=batch,
-                x_t=x_t,
-                t=t,
-                eps_pred_detached=eps_pred.detach(),  # meanには勾配を流さない
-                var_raw=var_raw,
-            )
+            if self.model.predict_sigma:
+                loss += vb_terms_bits_per_dim(
+                    scheduler=self.scheduler,
+                    x_start=batch,
+                    x_t=x_t,
+                    t=t,
+                    eps_pred_detached=eps_pred.detach(),  # meanには勾配を流さない
+                    var_raw=var_raw,
+                )
             # total loss
-            loss = ((mse + vb) * weights).mean()
+            loss = (loss * weights).mean()
 
         self.scaler.scale(loss).backward()
         self.scaler.step(self.opt)

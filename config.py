@@ -48,6 +48,7 @@ class ModelConfig(BaseModel):
     use_checkpoint: bool = True
     use_scale_shift_norm: bool = True
     resblock_updown: bool = True
+    predict_sigma: bool = False  # Schedulerに従って自動で切替
 
 
 class SchedulerConfig(BaseModel):
@@ -56,7 +57,7 @@ class SchedulerConfig(BaseModel):
     # 他設定の定義
     beta_schedule: str = "squaredcos_cap_v2"  # 他squaredcos_cap_v2等
     prediction_type: str = "epsilon"  # ε予測
-    variance_type: str = "learned_range"  # 分散は[-1,1]→[min_log,max_log]補間
+    variance_type: str = "fixed_small"  # or fixed_small
     clip_sample: bool = True
 
 
@@ -77,6 +78,10 @@ class Config(BaseSettings):
 
     class Config:
         env_nested_delimiter = "__"
+
+    @model_validator(mode="after")
+    def _update(self):
+        self.model.predict_sigma = "learn" in self.scheduler.variance_type
 
     @model_validator(mode="after")
     def _sync(self):
