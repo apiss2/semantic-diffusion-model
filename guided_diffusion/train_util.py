@@ -5,14 +5,33 @@ from typing import Iterator
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from diffusers.schedulers import DDPMScheduler
-from torch.amp import GradScaler
+from accelerate import Accelerator
+from diffusers.schedulers import (
+    DDIMScheduler,
+    DDPMScheduler,
+    DPMSolverMultistepScheduler,
+    UniPCMultistepScheduler,
+)
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .losses import vb_terms_bits_per_dim
 from .model import UNetModel, update_ema
+
+
+def create_inference_scheduler(name: str, train_scheduler: DDPMScheduler):
+    """推論サンプラーを学習スケジューラ設定から生成（beta/prediction_type等の整合を保証）"""
+    name = (name or "ddim").lower()
+    if name in ("ddim", "ddimscheduler"):
+        cls = DDIMScheduler
+    elif name in ("dpm", "dpmsolver", "dpm-solver", "dpm++", "dpmsolvermultistep"):
+        cls = DPMSolverMultistepScheduler
+    elif name in ("unipc", "unipc-multistep", "unipcmultistep"):
+        cls = UniPCMultistepScheduler
+    else:
+        raise ValueError(f"unknown inference scheduler: {name}")
+    return cls.from_config(train_scheduler.config)
 
 
 class TrainLoop:
@@ -31,10 +50,12 @@ class TrainLoop:
         resume_checkpoint: str,
         num_train_timesteps: int = 1000,
         use_bf16: bool = True,
-        fp16_scale_growth: float = 1e-3,
         weight_decay: float = 0.0,
         lr_anneal_steps: int = 0,
         grayscale: bool = False,
+        grad_accumulation_steps: int = 1,
+        max_grad_norm: float = 1.0,
+        inference_scheduler: str = "ddim",
     ):
         self.model: UNetModel = model
         self.scheduler: DDPMScheduler = scheduler
@@ -54,30 +75,42 @@ class TrainLoop:
             Path(resume_checkpoint) if resume_checkpoint != "" else None
         )
         self.use_bf16 = use_bf16
-        self.fp16_scale_growth = fp16_scale_growth
         self.schedule_sampler = UniformSampler(num_train_timesteps)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
         self.grayscale = grayscale
 
+        mixed_precision = "bf16" if use_bf16 else "no"
+        self.accelerator = Accelerator(
+            mixed_precision=mixed_precision,
+            gradient_accumulation_steps=grad_accumulation_steps,
+        )
+        self.device = self.accelerator.device
+        self.max_grad_norm = max_grad_norm
+        self.inference_scheduler_default = inference_scheduler
+
         self.step = 1
         self.resume_step = 0
 
+        # --- 既存のチェックポイント読み込み（prepare 前）---
         self._load_checkpoint()
 
-        self.scaler = GradScaler(enabled=self.use_bf16)
         self.opt = AdamW(
             self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
         )
 
+        # --- DDP wrap ---
+        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+
         if self.resume_step:
             self._load_optimizer_state()
-            # Model was resumed, either due to a restart or a checkpoint
-            # being specified at the command line.
             self.ema_models = [self._load_ema_model(rate) for rate in self.ema_rate]
-            self.ema_models = [model for model in self.ema_models if model is not None]
+            self.ema_models = [m for m in self.ema_models if m is not None]
         else:
-            self.ema_models = [copy.deepcopy(self.model).eval() for _ in self.ema_rate]
+            self.ema_models = [
+                copy.deepcopy(self.accelerator.unwrap_model(self.model)).eval()
+                for _ in self.ema_rate
+            ]
             for m in self.ema_models:
                 for p in m.parameters():
                     p.requires_grad_(False)
@@ -85,17 +118,18 @@ class TrainLoop:
     def _load_checkpoint(self):
         if self.resume_checkpoint:
             self.resume_step = parse_resume_step_from_filename(self.resume_checkpoint)
-            self.model.load_state_dict(torch.load(self.resume_checkpoint))
+            state = torch.load(self.resume_checkpoint, map_location="cpu")
+            self.model.load_state_dict(state)
 
     def _load_ema_model(self, rate):
         ema_checkpoint = find_ema_checkpoint(
             self.resume_checkpoint, self.resume_step, rate
         )
         if ema_checkpoint:
-            model = copy.deepcopy(self.model)
-            state_dict = torch.load(ema_checkpoint)
-            model.load_state_dict(state_dict)
-            return model
+            model = copy.deepcopy(self.model).to("cpu")
+            state_dict = torch.load(ema_checkpoint, map_location="cpu")
+            model.load_state_dict(state_dict, strict=True)
+            return model.eval()
         else:
             return None
 
@@ -104,7 +138,8 @@ class TrainLoop:
             name = f"ckpt/opt{self.resume_step:06}.pt"
             opt_checkpoint = self.save_dir / name
             assert opt_checkpoint.exists()
-            self.opt.load_state_dict(torch.load(opt_checkpoint))
+            opt_state = torch.load(opt_checkpoint, map_location="cpu")
+            self.opt.load_state_dict(opt_state)
             if self.opt.param_groups[0]["lr"] != self.lr:
                 self.opt.param_groups[0]["lr"] = self.lr
 
@@ -120,10 +155,11 @@ class TrainLoop:
                 self.save()
                 self.sanity_test(batch=batch, device="cuda", cond=cond)
             self.step += 1
-        # Save the last checkpoint if it wasn't already saved.
-        if (self.step - 1) % self.save_interval != 0:
+        # 最終保存
+        last = (self.step - 1) % self.save_interval != 0
+        if last and self.accelerator.is_main_process:
             self.save()
-            self.sanity_test(batch=batch, device="cuda", cond=cond)
+            self.sanity_test(batch=batch, device=str(self.device), cond=cond)
 
     def run_step(self, batch: torch.Tensor, cond: dict[str, torch.Tensor]):
         self.opt.zero_grad()
@@ -133,69 +169,82 @@ class TrainLoop:
         noise = torch.randn_like(batch, device="cuda")
         x_t = self.scheduler.add_noise(batch, noise, t)
 
-        # AMP
-        autocast_dtype = torch.bfloat16 if self.use_bf16 else torch.float32
-        with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=True):
-            _cond = {"semantic_map": cond["semantic_map"]}
-            outputs = self.model(sample=x_t, timestep=t, added_cond_kwargs=_cond)
-            model_out = outputs.sample
-            if self.model.predict_sigma:
-                eps_pred, var_raw = torch.chunk(model_out, 2, dim=1)
-                # ====== MSE(ε) ======
-                loss = ((noise - eps_pred) ** 2).mean(dim=(1, 2, 3))
-                # ====== VB 項（KL or NLL@t=0） ======
-                loss += vb_terms_bits_per_dim(
-                    scheduler=self.scheduler,
-                    x_start=batch,
-                    x_t=x_t,
-                    t=t,
-                    eps_pred_detached=eps_pred.detach(),  # meanには勾配を流さない
-                    var_raw=var_raw,
-                )
-            else:
-                loss = ((noise - model_out) ** 2).mean(dim=(1, 2, 3))
-            # total loss
-            loss = (loss * weights).mean()
+        self.opt.zero_grad(set_to_none=True)
 
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.opt)
-        self.scaler.update()
+        # AMP
+        with self.accelerator.accumulate(self.model):
+            with self.accelerator.autocast():
+                _cond = {"semantic_map": cond["semantic_map"]}
+                outputs = self.model(sample=x_t, timestep=t, added_cond_kwargs=_cond)
+                model_out = outputs.sample
+                if self.model.predict_sigma:
+                    eps_pred, var_raw = torch.chunk(model_out, 2, dim=1)
+                    # ====== MSE(ε) ======
+                    loss = ((noise - eps_pred) ** 2).mean(dim=(1, 2, 3))
+                    # ====== VB 項（KL or NLL@t=0） ======
+                    loss += vb_terms_bits_per_dim(
+                        scheduler=self.scheduler,
+                        x_start=batch,
+                        x_t=x_t,
+                        t=t,
+                        eps_pred_detached=eps_pred.detach(),  # meanには勾配を流さない
+                        var_raw=var_raw,
+                    )
+                else:
+                    loss = ((noise - model_out) ** 2).mean(dim=(1, 2, 3))
+                # total loss
+                loss = (loss * weights).mean()
+
+            self.accelerator.backward(loss)
+
+            if self.accelerator.sync_gradients and self.max_grad_norm is not None:
+                self.accelerator.clip_grad_norm_(
+                    self.model.parameters(), self.max_grad_norm
+                )
+
+            if self.accelerator.sync_gradients:
+                self.opt.step()
+
         self._update_ema()
         self._anneal_lr()
 
-        print(f"\rstep: {self.step} | loss: {loss.detach().cpu().numpy():.4f}", end="")
+        _loss = loss.detach().float().cpu().item()
+        self.accelerator.print(f"\rstep: {self.step} | loss: {loss:.4f}", end="")
 
     def _update_ema(self):
-        # 既存の update_ema(target_params, source_params, rate) を再利用
+        src_params = self.accelerator.unwrap_model(self.model).parameters()
         for rate, ema_model in zip(self.ema_rate, self.ema_models):
-            update_ema(
-                ema_model.parameters(), self.model.parameters(), rate=float(rate)
-            )
+            update_ema(ema_model.parameters(), src_params, rate=float(rate))
 
     def _anneal_lr(self):
         if not self.lr_anneal_steps:
             return
         frac_done = (self.step + self.resume_step) / self.lr_anneal_steps
         lr = self.lr * (1 - frac_done)
-        for param_group in self.opt.param_groups:
-            param_group["lr"] = lr
+        for pg in self.opt.param_groups:
+            pg["lr"] = lr
 
     def save(self):
         step = f"{(self.step + self.resume_step):06d}"
         sd = self.save_dir / "ckpt"
         sd.mkdir(exist_ok=True)
-        # main
-        torch.save(self.model.state_dict(), sd / f"model{step}.pt")
+
+        # unwrap した state_dict を保存（DDP wrapperを含めない）
+        state = self.accelerator.get_state_dict(self.model)
+        torch.save(state, sd / f"model{step}.pt")
+
         # EMA
         for rate, ema_model in zip(self.ema_rate, self.ema_models):
             torch.save(ema_model.state_dict(), sd / f"ema_{rate}_{step}.pt")
-        # optimizer
-        torch.save(self.opt.state_dict(), sd / f"opt{step}.pt")
+
+        # optimizer（rank0 のみ）
+        if self.accelerator.is_main_process:
+            torch.save(self.opt.state_dict(), sd / f"opt{step}.pt")
 
     def sanity_test(
         self, batch: torch.Tensor, device: str, cond: dict[str, torch.Tensor]
     ):
-        self.model.eval()
+        self.accelerator.unwrap_model(self.model).eval()
         x = torch.randn_like(batch, device=device)
         cond = {k: v.to(device) for k, v in cond.items()}
         total_steps = len(self.scheduler.timesteps)
@@ -203,30 +252,118 @@ class TrainLoop:
         snapshot_steps = [total_steps // 4 * i for i in range(1, 4)]
         snapshots = dict()
         with torch.no_grad():
+            _iter = enumerate(self.scheduler.timesteps[::5])
             total = len(self.scheduler.timesteps)
-            for i, t in tqdm(enumerate(self.scheduler.timesteps), total=total):
-                _t = torch.tensor([t] * x.shape[0], device=device)  # shape = [B]
+            disable = not self.accelerator.is_main_process
+            for i, t in tqdm(_iter, total=total, disable=disable):
+                _t = torch.tensor([t] * x.shape[0], device=device)
                 _cond = {"semantic_map": cond["semantic_map"]}
-                outputs = self.model(sample=x, timestep=_t, added_cond_kwargs=_cond)
+                outputs = self.accelerator.unwrap_model(self.model)(
+                    sample=x, timestep=_t, added_cond_kwargs=_cond
+                )
                 x_prev = self.scheduler.step(outputs.sample, t, x).prev_sample
-
-                # snapshot 用に x_prev を保存
                 if i in snapshot_steps:
                     idx = snapshot_steps.index(i)
                     snapshots[snapshot_names[idx]] = (x_prev + 1) / 2.0
                 x = x_prev
-        self.model.train()
+        self.accelerator.unwrap_model(self.model).train()
 
         src_img = ((batch + 1.0) / 2.0).to(device)
         inference_img = (x + 1) / 2.0
-        log_images(
-            inference_img=inference_img,
-            src_img=src_img,
-            snapshots=snapshots,
-            output_dir=self.save_dir / "snapshots",
-            step=self.step,
-            grayscale=self.grayscale,
+        if self.accelerator.is_main_process:
+            log_images(
+                inference_img=inference_img,
+                src_img=src_img,
+                snapshots=snapshots,
+                output_dir=self.save_dir / "snapshots",
+                step=self.step,
+                grayscale=self.grayscale,
+            )
+
+    @torch.no_grad()
+    def generate_with_cfg(
+        self,
+        batch_size: int,
+        cond: dict[str, torch.Tensor],
+        *,
+        scheduler_name: str | None = None,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 5.0,
+        use_ema: bool = True,
+        return_intermediate: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """
+        CFG (eps = eps_u + w*(eps_c - eps_u)) による生成。
+        条件は cond["semantic_map"] を使用。uncond は all-zero の one-hot を用いる。
+        """
+        device = self.device
+        model_for_infer = (
+            self.ema_models[0]
+            if (use_ema and len(self.ema_models) > 0)
+            else self.accelerator.unwrap_model(self.model)
         )
+        model_for_infer = model_for_infer.to(device).eval()
+
+        # 推論サンプラーを切替
+        name = scheduler_name or self.inference_scheduler_default
+        sched = create_inference_scheduler(name, self.scheduler)
+        sched.set_timesteps(num_inference_steps, device=device)
+
+        x = torch.randn(
+            batch_size,
+            model_for_infer.in_channels,
+            self.accelerator.unwrap_model(self.model).image_size,
+            self.accelerator.unwrap_model(self.model).image_size,
+            device=device,
+        )
+
+        # cond/uncond の準備
+        cond_map = cond["semantic_map"].to(device)  # [B,C,H,W] (one-hot or dropped)
+        if cond_map.shape[0] != batch_size:
+            # 最低限の合わせ込み
+            cond_map = cond_map[:batch_size]
+        uncond_map = torch.zeros_like(cond_map)
+
+        snapshots = {}
+        snap_points = {
+            int(num_inference_steps * 0.25): "25%",
+            int(num_inference_steps * 0.5): "50%",
+            int(num_inference_steps * 0.75): "75%",
+        }
+
+        for i, t in enumerate(sched.timesteps):
+            # diffusers の API に合わせる：t は shape=[B] でもスカラでも可
+            t_b = t
+
+            # two-pass
+            eps_c = model_for_infer(
+                sample=x, timestep=t_b, added_cond_kwargs={"semantic_map": cond_map}
+            ).sample
+            if model_for_infer.predict_sigma:
+                eps_c, var_c = torch.chunk(eps_c, 2, dim=1)
+
+            eps_u = model_for_infer(
+                sample=x, timestep=t_b, added_cond_kwargs={"semantic_map": uncond_map}
+            ).sample
+            if model_for_infer.predict_sigma:
+                eps_u, _ = torch.chunk(eps_u, 2, dim=1)
+
+            eps = eps_u + guidance_scale * (eps_c - eps_u)
+
+            if model_for_infer.predict_sigma:
+                model_out = torch.cat(
+                    [eps, var_c], dim=1
+                )  # var は cond 側を使用（一般的な実装）
+            else:
+                model_out = eps
+
+            x = sched.step(model_out, t, x).prev_sample
+
+            if return_intermediate and i in snap_points:
+                snapshots[snap_points[i]] = (x + 1) / 2.0
+
+        out = (x + 1) / 2.0
+        return (out, snapshots) if return_intermediate else out
 
     def preprocess_input(self, data: dict[str, torch.Tensor]):
         # move to GPU and change data types

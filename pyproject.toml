@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "accelerate>=1.10.0",
     "albumentations>=2.0.8",
     "blobfile>=3.0.0",
     "diffusers>=0.34.0",

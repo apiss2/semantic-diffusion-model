@@ -25,11 +25,13 @@ class TrainConfig(BaseModel):
     ema_rate: str = "0.9,0.99"  # comma-separated list of EMA values
     weight_decay: float = 1e-3
     lr_anneal_steps: int = 50000
-    save_interval: int = 5000
+    save_interval: int = 1000
     resume_checkpoint: str = ""
     use_bf16: bool = True
-    fp16_scale_growth: float = 1e-2
-    drop_rate: float = 0.0
+    drop_rate: float = 0.1
+    grad_accumulation_steps: int = 1
+    max_grad_norm: float = 1.0
+    inference_scheduler: str = "ddim"
 
 
 class ModelConfig(BaseModel):
