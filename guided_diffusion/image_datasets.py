@@ -38,6 +38,8 @@ def create_dataloader(
             shuffle=False,
             num_workers=num_workers,
             drop_last=True,
+            pin_memory=True,
+            prefetch_factor=2,
         )
     else:
         loader = DataLoader(
@@ -46,6 +48,8 @@ def create_dataloader(
             shuffle=True,
             num_workers=num_workers,
             drop_last=True,
+            pin_memory=True,
+            prefetch_factor=2,
         )
     while True:
         yield from loader

@@ -119,9 +119,6 @@ class TrainLoop:
             if self.step % self.save_interval == 0:
                 self.save()
                 self.sanity_test(batch=batch, device="cuda", cond=cond)
-                # Run for a finite amount of time in integration tests.
-                if self.step > 0:
-                    return
             self.step += 1
         # Save the last checkpoint if it wasn't already saved.
         if (self.step - 1) % self.save_interval != 0:
