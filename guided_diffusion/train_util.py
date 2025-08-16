@@ -30,7 +30,7 @@ class TrainLoop:
         save_interval: int,
         resume_checkpoint: str,
         num_train_timesteps: int = 1000,
-        use_fp16: bool = True,
+        use_bf16: bool = True,
         fp16_scale_growth: float = 1e-3,
         weight_decay: float = 0.0,
         lr_anneal_steps: int = 0,
@@ -53,7 +53,7 @@ class TrainLoop:
         self.resume_checkpoint = (
             Path(resume_checkpoint) if resume_checkpoint != "" else None
         )
-        self.use_fp16 = use_fp16
+        self.use_bf16 = use_bf16
         self.fp16_scale_growth = fp16_scale_growth
         self.schedule_sampler = UniformSampler(num_train_timesteps)
         self.weight_decay = weight_decay
@@ -65,7 +65,7 @@ class TrainLoop:
 
         self._load_checkpoint()
 
-        self.scaler = GradScaler(enabled=self.use_fp16)
+        self.scaler = GradScaler(enabled=self.use_bf16)
         self.opt = AdamW(
             self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
         )
@@ -94,10 +94,10 @@ class TrainLoop:
         if ema_checkpoint:
             model = copy.deepcopy(self.model)
             state_dict = torch.load(ema_checkpoint)
-            ema_model = model.load_state_dict(state_dict)
-            return ema_model
+            model.load_state_dict(state_dict)
+            return model
         else:
-            None
+            return None
 
     def _load_optimizer_state(self):
         if self.resume_checkpoint:
@@ -137,16 +137,16 @@ class TrainLoop:
         x_t = self.scheduler.add_noise(batch, noise, t)
 
         # AMP
-        autocast_dtype = torch.bfloat16 if self.use_fp16 else torch.float32
+        autocast_dtype = torch.bfloat16 if self.use_bf16 else torch.float32
         with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=True):
-            model_out = self.model(x_t, t, y=cond["y"])  # 2C 出力は現状維持
-            eps_pred, var_raw = torch.split(model_out, batch.shape[1], dim=1)
-
-            # ====== MSE(ε) ======
-            loss = ((noise - eps_pred) ** 2).mean(dim=(1, 2, 3))  # mean_flat と同等
-
-            # ====== VB 項（KL or NLL@t=0） ======
+            _cond = {"semantic_map": cond["semantic_map"]}
+            outputs = self.model(sample=x_t, timestep=t, added_cond_kwargs=_cond)
+            model_out = outputs.sample
             if self.model.predict_sigma:
+                eps_pred, var_raw = torch.chunk(model_out, 2, dim=1)
+                # ====== MSE(ε) ======
+                loss = ((noise - eps_pred) ** 2).mean(dim=(1, 2, 3))
+                # ====== VB 項（KL or NLL@t=0） ======
                 loss += vb_terms_bits_per_dim(
                     scheduler=self.scheduler,
                     x_start=batch,
@@ -155,6 +155,8 @@ class TrainLoop:
                     eps_pred_detached=eps_pred.detach(),  # meanには勾配を流さない
                     var_raw=var_raw,
                 )
+            else:
+                loss = ((noise - model_out) ** 2).mean(dim=(1, 2, 3))
             # total loss
             loss = (loss * weights).mean()
 
@@ -206,9 +208,11 @@ class TrainLoop:
         with torch.no_grad():
             total = len(self.scheduler.timesteps)
             for i, t in tqdm(enumerate(self.scheduler.timesteps), total=total):
-                t_batch = torch.tensor([t] * x.shape[0], device=device)  # shape = [B]
-                model_out = self.model(x, t_batch, y=cond["y"])  # 2C出力
-                x_prev = self.scheduler.step(model_out, t, x).prev_sample
+                _t = torch.tensor([t] * x.shape[0], device=device)  # shape = [B]
+                _cond = {"semantic_map": cond["semantic_map"]}
+                outputs = self.model(sample=x, timestep=_t, added_cond_kwargs=_cond)
+                x_prev = self.scheduler.step(outputs.sample, t, x).prev_sample
+
                 # snapshot 用に x_prev を保存
                 if i in snapshot_steps:
                     idx = snapshot_steps.index(i)
@@ -235,7 +239,8 @@ class TrainLoop:
         label_map = data["label"]
         bs, _, h, w = label_map.size()
         nc = self.num_classes
-        input_label = torch.FloatTensor(bs, nc, h, w).zero_()
+        device = label_map.device
+        input_label = torch.FloatTensor(bs, nc, h, w, device=device).zero_()
         input_semantics = input_label.scatter_(1, label_map, 1.0)
 
         if self.drop_rate > 0.0:
@@ -247,8 +252,7 @@ class TrainLoop:
         cond = {
             key: value for key, value in data.items() if key not in ["label", "path"]
         }
-        cond["y"] = input_semantics
-
+        cond["semantic_map"] = input_semantics
         return cond
 
 

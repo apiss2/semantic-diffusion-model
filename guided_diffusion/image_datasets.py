@@ -81,7 +81,7 @@ class SDMDataset(Dataset):
         if transforms is None:
             self.transforms = A.Compose(
                 [
-                    A.Resize(size, size, interpolation=Image.Resampling.BILINEAR),
+                    A.Resize(size, size),
                     A.HorizontalFlip(),
                 ]
             )
@@ -92,7 +92,7 @@ class SDMDataset(Dataset):
     def __getitem__(self, i: int):
         image: Image.Image = Image.open(self.image_pathes[i])
         if self.grayscale:
-            img = np.array(image.convert("L"))
+            img = np.array(image.convert("L"))[..., None]
         else:
             img = np.array(image.convert("RGB"))
         mask = np.array(Image.open(self.label_pathes[i]))  # (H, W) int labels

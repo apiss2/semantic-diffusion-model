@@ -27,7 +27,7 @@ class TrainConfig(BaseModel):
     lr_anneal_steps: int = 50000
     save_interval: int = 5000
     resume_checkpoint: str = ""
-    use_fp16: bool = True
+    use_bf16: bool = True
     fp16_scale_growth: float = 1e-2
     drop_rate: float = 0.0
 
@@ -82,6 +82,7 @@ class Config(BaseSettings):
     @model_validator(mode="after")
     def _update(self):
         self.model.predict_sigma = "learn" in self.scheduler.variance_type
+        return self
 
     @model_validator(mode="after")
     def _sync(self):

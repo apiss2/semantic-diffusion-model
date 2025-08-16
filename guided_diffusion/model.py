@@ -1,12 +1,16 @@
 import math
 from abc import abstractmethod
+from dataclasses import dataclass
+from typing import Iterator, Optional, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Iterator
 import torch.utils.checkpoint as cp
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.utils import BaseOutput
 
 
 # PyTorch 1.7 has SiLU, but we support PyTorch 1.5.
@@ -562,7 +566,12 @@ class QKVAttention(nn.Module):
         return count_flops_attn(model, _x, y)
 
 
-class UNetModel(nn.Module):
+@dataclass
+class UNet2DOutput(BaseOutput):
+    sample: torch.FloatTensor
+
+
+class UNetModel(ModelMixin, ConfigMixin):  # ← nn.Module の代わりに ModelMixin を継承
     """
     The full UNet model with attention and timestep embedding.
 
@@ -591,6 +600,7 @@ class UNetModel(nn.Module):
     :param resblock_updown: use residual blocks for up/downsampling.
     """
 
+    @register_to_config
     def __init__(
         self,
         image_size: int,
@@ -623,9 +633,7 @@ class UNetModel(nn.Module):
         self.image_size = image_size
         self.in_channels = 1 if grayscale else 3
         self.model_channels = model_channels
-        self.out_channels = self.in_channels
-        if predict_sigma:
-            self.out_channels *= 2
+        self.out_channels = self.in_channels * (2 if predict_sigma else 1)
         self.num_res_blocks = num_res_blocks
         self.attention_resolutions = tuple(attention_ds)
         self.dropout = dropout
@@ -645,7 +653,7 @@ class UNetModel(nn.Module):
             nn.Linear(time_embed_dim, time_embed_dim),
         )
 
-        ch = input_ch = int(self.channel_mult[0] * model_channels)
+        ch = int(self.channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
             [TimestepEmbedSequential(conv_nd(dims, self.in_channels, ch, 3, padding=1))]
         )
@@ -781,29 +789,45 @@ class UNetModel(nn.Module):
         self.out = nn.Sequential(
             nn.GroupNorm(32, ch),
             SiLU(),
-            zero_module(conv_nd(dims, input_ch, self.out_channels, 3, padding=1)),
+            zero_module(conv_nd(dims, ch, self.out_channels, 3, padding=1)),
         )
 
-    def forward(self, x, timesteps, y=None):
+    def forward(
+        self,
+        sample: torch.FloatTensor,
+        timestep: Union[torch.Tensor, int, float],
+        *,
+        added_cond_kwargs: Optional[dict[str, torch.Tensor]] = None,
+        return_dict: bool = True,
+    ) -> Union[UNet2DOutput, torch.FloatTensor]:
+        """diffusers 互換 forward。
+        - 条件は added_cond_kwargs["semantic_map"] で受け取ります。
+        - return_dict=True で UNet2DOutput を返します。
         """
-        Apply the model to an input batch.
+        # 整形
+        if not torch.is_tensor(timestep):
+            timestep = torch.tensor([timestep], device=sample.device)
+        if timestep.ndim == 0:
+            timestep = timestep[None]
+        if timestep.shape[0] != sample.shape[0]:
+            timestep = timestep.expand(sample.shape[0])
 
-        :param x: an [N x C x ...] Tensor of inputs.
-        :param timesteps: a 1-D batch of timesteps.
-        :param y: an [N] Tensor of labels, if class-conditional.
-        :return: an [N x C x ...] Tensor of outputs.
-        """
-        assert (y is not None) == (self.num_classes is not None), (
-            "must specify y if and only if the model is class-conditional"
-        )
+        y = None
+        if self.num_classes is not None:
+            if added_cond_kwargs is None or "semantic_map" not in added_cond_kwargs:
+                raise ValueError("added_cond_kwargs['semantic_map'] が必要です")
+            y = added_cond_kwargs["semantic_map"]
+            assert y.shape == (
+                sample.shape[0],
+                self.num_classes,
+                sample.shape[2],
+                sample.shape[3],
+            ), f"semantic_map shape mismatch: {y.shape}"
 
         hs = []
-        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+        emb = self.time_embed(timestep_embedding(timestep, self.model_channels))
 
-        if self.num_classes is not None:
-            assert y.shape == (x.shape[0], self.num_classes, x.shape[2], x.shape[3])
-
-        h = x
+        h = sample
         for module in self.input_blocks:
             h = module(h, y, emb)
             hs.append(h)
@@ -811,7 +835,11 @@ class UNetModel(nn.Module):
         for module in self.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
             h = module(h, y, emb)
-        return self.out(h)
+        out = self.out(h)
+        if return_dict:
+            return UNet2DOutput(sample=out)
+        else:
+            return out
 
 
 def get_channel_mult(channel_mult: str, image_size: int):
