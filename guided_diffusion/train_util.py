@@ -292,7 +292,7 @@ class TrainLoop:
         self, batch: torch.Tensor, device: str, cond: dict[str, torch.Tensor]
     ):
         self.accelerator.unwrap_model(self.model).eval()
-        x = torch.randn_like(batch, device=device)
+        x = torch.randn_like(batch, device=device) * self.scheduler.init_noise_sigma
         cond = {k: v.to(device) for k, v in cond.items()}
         total_steps = len(self.scheduler.timesteps)
         snapshot_names = ["25%", "50%", "75%"]
@@ -308,6 +308,7 @@ class TrainLoop:
                     sample=x, timestep=_t, added_cond_kwargs=_cond
                 )
                 x_prev = self.scheduler.step(outputs.sample, t, x).prev_sample
+                x_prev = x_prev.clamp(-1, 1)
                 if i in snapshot_steps:
                     idx = snapshot_steps.index(i)
                     snapshots[snapshot_names[idx]] = (x_prev + 1) / 2.0
