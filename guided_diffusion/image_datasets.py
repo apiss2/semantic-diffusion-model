@@ -100,6 +100,7 @@ class SDMDataset(Dataset):
         else:
             img = np.array(image.convert("RGB"))
         mask = np.array(Image.open(self.label_pathes[i]))  # (H, W) int labels
+        mask = mask.clip(0, self.num_classes)
 
         # Augmentation
         aug = self.transforms(image=img, mask=mask)

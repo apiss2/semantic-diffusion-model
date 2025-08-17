@@ -2,7 +2,6 @@ import copy
 from pathlib import Path
 from typing import Iterator
 
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from accelerate import Accelerator
@@ -14,10 +13,12 @@ from diffusers.schedulers import (
 )
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from .losses import vb_terms_bits_per_dim
 from .model import UNetModel, update_ema
+from .viz_util import log_images
 
 
 def create_inference_scheduler(name: str, train_scheduler: DDPMScheduler):
@@ -48,7 +49,6 @@ class TrainLoop:
         drop_rate: float,
         save_interval: int,
         resume_checkpoint: str,
-        num_train_timesteps: int = 1000,
         use_bf16: bool = True,
         weight_decay: float = 0.0,
         lr_anneal_steps: int = 0,
@@ -56,6 +56,8 @@ class TrainLoop:
         grad_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0,
         inference_scheduler: str = "ddim",
+        p2_loss_k: float = 0.0,
+        p2_importance_sampling: bool = False,
     ):
         self.model: UNetModel = model
         self.scheduler: DDPMScheduler = scheduler
@@ -75,7 +77,11 @@ class TrainLoop:
             Path(resume_checkpoint) if resume_checkpoint != "" else None
         )
         self.use_bf16 = use_bf16
-        self.schedule_sampler = UniformSampler(num_train_timesteps)
+        self.schedule_sampler = UniformSampler(
+            scheduler=self.scheduler,
+            p2_loss_k=p2_loss_k,
+            importance_sampling=p2_importance_sampling,
+        )
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
         self.grayscale = grayscale
@@ -114,6 +120,10 @@ class TrainLoop:
             for m in self.ema_models:
                 for p in m.parameters():
                     p.requires_grad_(False)
+        # TensorBoard（rank0 のみ）
+        self.tb: SummaryWriter | None = None
+        if self.accelerator.is_main_process:
+            self.tb = SummaryWriter(log_dir=str(self.save_dir / "tb"))
 
     def _load_checkpoint(self):
         if self.resume_checkpoint:
@@ -202,6 +212,22 @@ class TrainLoop:
                     self.model.parameters(), self.max_grad_norm
                 )
 
+            # grad norm（記録用）
+            grad_norm = None
+            if self.accelerator.sync_gradients:
+                # clip と同じタイミングで OK（クリップ後の値を記録）
+                if self.max_grad_norm is not None:
+                    self.accelerator.clip_grad_norm_(
+                        self.model.parameters(), self.max_grad_norm
+                    )
+                # 総合ノルムを計算
+                total_sq = 0.0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        g = p.grad.detach()
+                        total_sq += float(g.norm(2).item() ** 2)
+                grad_norm = float(total_sq**0.5)
+
             if self.accelerator.sync_gradients:
                 self.opt.step()
 
@@ -210,6 +236,27 @@ class TrainLoop:
 
         _loss = loss.detach().float().cpu().item()
         self.accelerator.print(f"\rstep: {self.step} | loss: {loss:.4f}", end="")
+
+        # ===== TensorBoard =====
+        if self.tb is not None:
+            gstep = self.step + self.resume_step
+            self.tb.add_scalar("train/loss", _loss, gstep)
+            self.tb.add_scalar("train/lr", self.opt.param_groups[0]["lr"], gstep)
+            if grad_norm is not None:
+                self.tb.add_scalar("train/grad_norm", grad_norm, gstep)
+            # ema decay（定数でも“随時”出す）
+            for i, r in enumerate(self.ema_rate):
+                self.tb.add_scalar(f"ema/decay_{i}", float(r), gstep)
+            # 100step ごとに EMA と本体の L2 距離も出す（任意）
+            if (gstep % 100 == 0) and (len(self.ema_models) > 0):
+                ema0 = self.ema_models[0]
+                dist_sq = 0.0
+                for p, q in zip(
+                    self.accelerator.unwrap_model(self.model).parameters(),
+                    ema0.parameters(),
+                ):
+                    dist_sq += float((p.detach() - q.detach()).pow(2).sum().item())
+                self.tb.add_scalar("ema/distance_l2", dist_sq**0.5, gstep)
 
     def _update_ema(self):
         src_params = self.accelerator.unwrap_model(self.model).parameters()
@@ -252,10 +299,9 @@ class TrainLoop:
         snapshot_steps = [total_steps // 4 * i for i in range(1, 4)]
         snapshots = dict()
         with torch.no_grad():
-            _iter = enumerate(self.scheduler.timesteps[::5])
-            total = len(self.scheduler.timesteps)
+            _iter = enumerate(self.scheduler.timesteps)
             disable = not self.accelerator.is_main_process
-            for i, t in tqdm(_iter, total=total, disable=disable):
+            for i, t in tqdm(_iter, total=total_steps, disable=disable):
                 _t = torch.tensor([t] * x.shape[0], device=device)
                 _cond = {"semantic_map": cond["semantic_map"]}
                 outputs = self.accelerator.unwrap_model(self.model)(
@@ -268,14 +314,14 @@ class TrainLoop:
                 x = x_prev
         self.accelerator.unwrap_model(self.model).train()
 
-        src_img = ((batch + 1.0) / 2.0).to(device)
-        inference_img = (x + 1) / 2.0
         if self.accelerator.is_main_process:
             log_images(
-                inference_img=inference_img,
-                src_img=src_img,
+                src_img=batch.to(device),
+                cond_map=cond["semantic_map"],
+                inference_img=x,
                 snapshots=snapshots,
                 output_dir=self.save_dir / "snapshots",
+                class_num=self.num_classes,
                 step=self.step,
                 grayscale=self.grayscale,
             )
@@ -318,7 +364,7 @@ class TrainLoop:
         )
 
         # cond/uncond の準備
-        cond_map = cond["semantic_map"].to(device)  # [B,C,H,W] (one-hot or dropped)
+        cond_map = cond["semantic_map"].to(device)
         if cond_map.shape[0] != batch_size:
             # 最低限の合わせ込み
             cond_map = cond_map[:batch_size]
@@ -391,8 +437,23 @@ class TrainLoop:
 
 
 class UniformSampler:
-    def __init__(self, diffusion_steps: int):
-        self._weights = np.ones([diffusion_steps])
+    def __init__(
+        self,
+        scheduler: DDPMScheduler,
+        p2_loss_k: float = 0.0,
+        importance_sampling: bool = False,
+    ):
+        self.importance_sampling = importance_sampling
+        # ᾱ_t（DDPM の cumulative product）に基づく p2 係数
+        alphas_cumprod = scheduler.alphas_cumprod.detach().cpu().numpy()
+        if p2_loss_k > 0.0:
+            p2 = (1.0 - alphas_cumprod) ** float(p2_loss_k)
+        else:
+            p2 = np.ones_like(alphas_cumprod)
+        # サンプリング分布
+        self._weights = p2.copy() if importance_sampling else np.ones_like(p2)
+        # ロスに掛ける係数（IS しないなら (1-ᾱ)^p をここで使う）
+        self._p2_loss_weights = p2
 
     def weights(self):
         return self._weights
@@ -400,18 +461,15 @@ class UniformSampler:
     def sample(self, batch_size: int, device: str):
         """
         Importance-sample timesteps for a batch.
-
-        :param batch_size: the number of timesteps.
-        :param device: the torch device to save to.
-        :return: a tuple (timesteps, weights):
-                 - timesteps: a tensor of timestep indices.
-                 - weights: a tensor of weights to scale the resulting losses.
+        return: (timesteps, weights)
+        weights は unbiased 化のための 1/(N p[t]) に p2 loss 係数を掛けたもの。
         """
         w = self.weights()
         p = w / np.sum(w)
         indices_np = np.random.choice(len(p), size=(batch_size,), p=p)
         indices = torch.from_numpy(indices_np).long().to(device)
         weights_np = 1 / (len(p) * p[indices_np])
+        weights_np = weights_np * self._p2_loss_weights[indices_np]
         weights = torch.from_numpy(weights_np).float().to(device)
         return indices, weights
 
@@ -442,51 +500,3 @@ def find_ema_checkpoint(
     if path.exists():
         return path
     return None
-
-
-def log_images(
-    inference_img: torch.Tensor,
-    src_img: torch.Tensor,
-    snapshots: dict[str, torch.Tensor],
-    output_dir: Path,
-    step: int,
-    grayscale: bool,
-):
-    output_dir.mkdir(exist_ok=True)
-    num_rows = 2 + len(snapshots)
-    num_cols = inference_img.shape[0]
-    base_width = 4
-    base_height = 4
-    fig_width = num_cols * base_width + 2
-    fig_height = num_rows * base_height
-
-    fig, axs = plt.subplots(num_rows, num_cols, figsize=(fig_width, fig_height))
-    fig.suptitle("Diffusion Model Results", fontsize=16)
-
-    src_img = src_img.cpu().detach().numpy().transpose(0, 2, 3, 1)
-    inference_img = inference_img.cpu().detach().numpy().transpose(0, 2, 3, 1)
-    c = 1 if grayscale else 3
-    src_img = np.clip(src_img[..., :c], 0, 1)
-    inference_img = np.clip(inference_img[..., :c], 0, 1)
-
-    kwargs = dict(cmap="gray") if grayscale else dict()
-    for k in range(num_cols):
-        axs[0, k].imshow(src_img[k], **kwargs)
-        axs[0, k].axis("off")
-
-        axs[1, k].imshow(inference_img[k], **kwargs)
-        axs[1, k].axis("off")
-
-        for i, snap in enumerate(snapshots.values()):
-            tmp = np.clip(snap[k, :c, ...].cpu().detach().numpy(), 0, 1)
-            axs[i + 2, k].imshow(tmp.transpose(1, 2, 0), **kwargs)
-            axs[i + 2, k].axis("off")
-
-    axs[0, 0].set_title("Source Image")
-    axs[1, 0].set_title("Inference Image")
-    for i, snap in enumerate(snapshots):
-        axs[i + 2, 0].set_title(f"Snapshot {snap}")
-
-    plt.tight_layout(rect=[0, 0.0, 1, 0.95])
-    plt.savefig(output_dir / f"{str(step).zfill(6)}.png")
-    plt.close()

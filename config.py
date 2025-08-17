@@ -18,20 +18,21 @@ class TrainConfig(BaseModel):
     # 複数の設定に跨る値を定義
     batch_size: int | None = None
     num_classes: int | None = None
-    num_train_timesteps: int | None = None
     grayscale: bool | None = None
     # 他設定の定義
     lr: float = 1e-4
     ema_rate: str = "0.9,0.99"  # comma-separated list of EMA values
     weight_decay: float = 1e-3
-    lr_anneal_steps: int = 50000
-    save_interval: int = 1000
+    lr_anneal_steps: int = 100000
+    save_interval: int = 10000
     resume_checkpoint: str = ""
     use_bf16: bool = True
-    drop_rate: float = 0.1
+    drop_rate: float = 0.0
     grad_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
     inference_scheduler: str = "ddim"
+    p2_loss_k: float = 0.0
+    p2_importance_sampling: bool = False
 
 
 class ModelConfig(BaseModel):
@@ -51,12 +52,11 @@ class ModelConfig(BaseModel):
     use_scale_shift_norm: bool = True
     resblock_updown: bool = True
     predict_sigma: bool = False  # Schedulerに従って自動で切替
+    use_sdpa_attn: bool = False
 
 
 class SchedulerConfig(BaseModel):
-    # 複数の設定に跨る値を定義
-    num_train_timesteps: int | None = None
-    # 他設定の定義
+    num_train_timesteps: int = 1000
     beta_schedule: str = "squaredcos_cap_v2"  # 他squaredcos_cap_v2等
     prediction_type: str = "epsilon"  # ε予測
     variance_type: str = "fixed_small"  # or fixed_small
@@ -70,7 +70,6 @@ class Config(BaseSettings):
     image_size: int = Field(128)
     batch_size: int = Field(8)
     num_classes: int = Field(19)
-    num_train_timesteps: int = Field(1000)
     grayscale: bool = Field(False)
 
     train: TrainConfig = TrainConfig()
@@ -99,7 +98,6 @@ class Config(BaseSettings):
             "batch_size": ("dataset", "train"),
             "num_classes": ("dataset", "train", "model"),
             "grayscale": ("dataset", "train"),
-            "num_train_timesteps": ("scheduler", "train"),
         }
 
         for key, sections in shared_map.items():

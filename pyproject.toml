@@ -12,7 +12,9 @@ dependencies = [
     "matplotlib>=3.10.5",
     "pydantic>=2.11.7",
     "pydantic-settings>=2.10.1",
+    "tensorboard>=2.20.0",
     "torch>=2.5.1",
+    "torch-tb-profiler>=0.4.3",
     "torchvision>=0.20.1",
     "tqdm>=4.67.1",
     "transformers>=4.55.1",
@@ -30,3 +32,6 @@ torchvision = [
 name = "pytorch-cu121"
 url = "https://download.pytorch.org/whl/cu121"
 explicit = true
+
+[dependency-groups]
+dev = []

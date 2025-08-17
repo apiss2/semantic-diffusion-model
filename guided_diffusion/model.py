@@ -509,6 +509,69 @@ class AttentionBlock(nn.Module):
         return (x + h).reshape(b, c, *spatial)
 
 
+class AttentionBlockSDPA(nn.Module):
+    """
+    SDPA (scaled_dot_product_attention) を使うアテンション実装
+    - fp16/bf16 で数値安定 & 高速
+    """
+
+    def __init__(
+        self,
+        channels,
+        num_heads=1,
+        num_head_channels=-1,
+        use_checkpoint=False,
+    ):
+        super().__init__()
+        self.channels = channels
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            assert channels % num_head_channels == 0, (
+                f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
+            )
+            self.num_heads = channels // num_head_channels
+        self.use_checkpoint = use_checkpoint
+        self.norm = nn.GroupNorm(32, channels)
+        self.qkv = conv_nd(1, channels, channels * 3, 1)  # [B,C,T] 用の 1D conv
+        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+    def _sdpa(self, q, k, v):
+        # q,k,v: [B, H, T, D]; 返り値も同形
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        return out
+
+    def _forward(self, x):
+        b, c, *spatial = x.shape
+        x_flat = x.reshape(b, c, -1)  # [B, C, T]
+        h = self.norm(x_flat)
+        qkv = self.qkv(h)  # [B, 3C, T]
+        q, k, v = qkv.chunk(3, dim=1)
+
+        h_ = self.num_heads
+        d = c // h_
+
+        # [B, C, T] -> [B, H, T, D]
+        def to_heads(t):
+            return t.view(b, h_, d, -1).permute(0, 1, 3, 2).contiguous()
+
+        q = to_heads(q)
+        k = to_heads(k)
+        v = to_heads(v)
+
+        a = self._sdpa(q, k, v)  # [B, H, T, D]
+        # [B, H, T, D] -> [B, C, T]
+        a = a.permute(0, 1, 3, 2).contiguous().view(b, c, -1)
+        a = self.proj_out(a)
+        return (x_flat + a).reshape(b, c, *spatial)
+
+    def forward(self, x):
+        if self.use_checkpoint:
+            return cp.checkpoint(self._forward, x, use_reentrant=False)
+        else:
+            return self._forward(x)
+
+
 def count_flops_attn(model, _x, y):
     """
     A counter for the `thop` package to count the operations in an
@@ -620,6 +683,7 @@ class UNetModel(ModelMixin, ConfigMixin):  # ← nn.Module の代わりに Model
         resblock_updown: bool = False,
         grayscale: bool = False,
         predict_sigma: bool = False,
+        use_sdpa_attn: bool = True,
     ):
         super().__init__()
 
@@ -659,6 +723,7 @@ class UNetModel(ModelMixin, ConfigMixin):  # ← nn.Module の代わりに Model
         )
         self._feature_size = ch
         input_block_chans = [ch]
+        Attn = AttentionBlockSDPA if use_sdpa_attn else AttentionBlock  # ← 追加
         ds = 1
         for level, mult in enumerate(self.channel_mult):
             for _ in range(num_res_blocks):
@@ -676,7 +741,7 @@ class UNetModel(ModelMixin, ConfigMixin):  # ← nn.Module の代わりに Model
                 ch = int(mult * model_channels)
                 if ds in self.attention_resolutions:
                     layers.append(
-                        AttentionBlock(
+                        Attn(
                             ch,
                             use_checkpoint=use_checkpoint,
                             num_heads=num_heads,
@@ -721,7 +786,7 @@ class UNetModel(ModelMixin, ConfigMixin):  # ← nn.Module の代わりに Model
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
             ),
-            AttentionBlock(
+            Attn(
                 ch,
                 use_checkpoint=use_checkpoint,
                 num_heads=num_heads,
@@ -758,7 +823,7 @@ class UNetModel(ModelMixin, ConfigMixin):  # ← nn.Module の代わりに Model
                 ch = int(model_channels * mult)
                 if ds in self.attention_resolutions:
                     layers.append(
-                        AttentionBlock(
+                        Attn(
                             ch,
                             use_checkpoint=use_checkpoint,
                             num_heads=num_heads_upsample,
