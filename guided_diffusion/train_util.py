@@ -174,7 +174,9 @@ class TrainLoop:
     def run_step(self, batch: torch.Tensor, cond: dict[str, torch.Tensor]):
         self.opt.zero_grad()
         batch = batch.to("cuda")
-        cond = {k: v.to("cuda") for k, v in cond.items()}
+        semantic_map = cond["semantic_map"].to("cuda")
+        if "conds" in cond:
+            conds = {k: v.long().to("cuda") for k, v in cond["conds"].items()}
         t, weights = self.schedule_sampler.sample(batch.shape[0], "cuda")
         noise = torch.randn_like(batch, device="cuda")
         x_t = self.scheduler.add_noise(batch, noise, t)
@@ -184,7 +186,9 @@ class TrainLoop:
         # AMP
         with self.accelerator.accumulate(self.model):
             with self.accelerator.autocast():
-                _cond = {"semantic_map": cond["semantic_map"]}
+                _cond = {"semantic_map": semantic_map}
+                if "conds" in cond:
+                    _cond["conds"] = conds
                 outputs = self.model(sample=x_t, timestep=t, added_cond_kwargs=_cond)
                 model_out = outputs.sample
                 if self.model.predict_sigma:
@@ -294,6 +298,9 @@ class TrainLoop:
         self.accelerator.unwrap_model(self.model).eval()
         x = torch.randn_like(batch, device=device) * self.scheduler.init_noise_sigma
         cond = {k: v.to(device) for k, v in cond.items()}
+        _cond = {"semantic_map": cond["semantic_map"].to(device)}
+        if "conds" in cond:
+            _cond["conds"] = {k: v.to(device) for k, v in _cond["conds"].items()}
         total_steps = len(self.scheduler.timesteps)
         snapshot_names = ["25%", "50%", "75%"]
         snapshot_steps = [total_steps // 4 * i for i in range(1, 4)]

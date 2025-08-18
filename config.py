@@ -11,6 +11,7 @@ class DatasetConfig(BaseModel):
     # 他設定の定義
     image_dir: str = "D:/Datasets/CelebAMask-HQ/CelebA-HQ-img-512/"
     label_dir: str = "D:/Datasets/CelebAMask-HQ/CelebAMask-HQ-mask-img/"
+    conds_json: str = "D:/Datasets/CelebAMask-HQ/conditions.json"
     num_workers: int = 8
 
 
@@ -53,6 +54,9 @@ class ModelConfig(BaseModel):
     resblock_updown: bool = True
     predict_sigma: bool = False  # Schedulerに従って自動で切替
     use_sdpa_attn: bool = False
+    cond_spec: dict[str, dict[str, str | int]] = {
+        "gender": {"type": "categorical", "num_classes": 2},
+    }
 
 
 class SchedulerConfig(BaseModel):

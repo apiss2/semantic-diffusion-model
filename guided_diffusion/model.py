@@ -629,12 +629,50 @@ class QKVAttention(nn.Module):
         return count_flops_attn(model, _x, y)
 
 
+class ConditionEncoder(nn.Module):
+    def __init__(self, spec: dict, out_dim: int):
+        super().__init__()
+        self.out_dim = out_dim
+        self.enc = nn.ModuleDict()
+        self.gain = nn.ParameterDict()
+        self.norm = nn.LayerNorm(out_dim)
+
+        for name, s in spec.items():
+            t = s["type"]
+            if t == "categorical":
+                self.enc[name] = nn.Embedding(s["num_classes"], out_dim)
+            elif t == "multilabel":
+                self.enc[name] = nn.Linear(s["num_classes"], out_dim, bias=False)
+            elif t == "scalar":
+                self.enc[name] = nn.Sequential(
+                    nn.Linear(1, out_dim), nn.SiLU(), nn.Linear(out_dim, out_dim)
+                )
+            else:
+                raise ValueError(f"unknown cond type: {t}")
+            self.gain[name] = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, conds: dict[str, torch.Tensor] | None):
+        if not conds:
+            return None
+        pieces = []
+        for k, v in conds.items():
+            if k not in self.enc:  # 未定義キーは無視
+                continue
+            # 形状（例）：cat: (B,), multilabel: (B,C), scalar: (B,1)
+            z = self.enc[k](v) if v.dtype == torch.long else self.enc[k](v.float())
+            z = self.norm(z) * self.gain[k]
+            pieces.append(z)
+        if not pieces:
+            return None
+        return torch.stack(pieces, dim=0).sum(dim=0)  # (B, out_dim)
+
+
 @dataclass
 class UNet2DOutput(BaseOutput):
     sample: torch.FloatTensor
 
 
-class UNetModel(ModelMixin, ConfigMixin):  # ← nn.Module の代わりに ModelMixin を継承
+class UNetModel(ModelMixin, ConfigMixin):
     """
     The full UNet model with attention and timestep embedding.
 
@@ -670,6 +708,7 @@ class UNetModel(ModelMixin, ConfigMixin):  # ← nn.Module の代わりに Model
         model_channels: int,
         num_res_blocks: int,
         attention_resolutions: str,
+        cond_spec: dict[str, dict[str, str | int]] | None = None,
         dropout: float = 0.0,
         channel_mult: str = "",
         conv_resample: bool = True,
@@ -716,6 +755,9 @@ class UNetModel(ModelMixin, ConfigMixin):  # ← nn.Module の代わりに Model
             SiLU(),
             nn.Linear(time_embed_dim, time_embed_dim),
         )
+        self.cond_encoder: ConditionEncoder | None = None
+        if cond_spec:
+            self.cond_encoder = ConditionEncoder(spec=cond_spec, out_dim=time_embed_dim)
 
         ch = int(self.channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
@@ -891,6 +933,11 @@ class UNetModel(ModelMixin, ConfigMixin):  # ← nn.Module の代わりに Model
 
         hs = []
         emb = self.time_embed(timestep_embedding(timestep, self.model_channels))
+        cond_vec = None
+        if added_cond_kwargs is not None and "conds" in added_cond_kwargs:
+            cond_vec = self.cond_encoder(added_cond_kwargs["conds"])
+        if cond_vec is not None:
+            emb = emb + cond_vec
 
         h = sample
         for module in self.input_blocks:
