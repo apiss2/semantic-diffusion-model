@@ -297,10 +297,9 @@ class TrainLoop:
     ):
         self.accelerator.unwrap_model(self.model).eval()
         x = torch.randn_like(batch, device=device) * self.scheduler.init_noise_sigma
-        cond = {k: v.to(device) for k, v in cond.items()}
-        _cond = {"semantic_map": cond["semantic_map"].to(device)}
+        cond["semantic_map"] = cond["semantic_map"].to(device)
         if "conds" in cond:
-            _cond["conds"] = {k: v.to(device) for k, v in _cond["conds"].items()}
+            cond["conds"] = {k: v.to(device) for k, v in cond["conds"].items()}
         total_steps = len(self.scheduler.timesteps)
         snapshot_names = ["25%", "50%", "75%"]
         snapshot_steps = [total_steps // 4 * i for i in range(1, 4)]
@@ -310,9 +309,8 @@ class TrainLoop:
             disable = not self.accelerator.is_main_process
             for i, t in tqdm(_iter, total=total_steps, disable=disable):
                 _t = torch.tensor([t] * x.shape[0], device=device)
-                _cond = {"semantic_map": cond["semantic_map"]}
                 outputs = self.accelerator.unwrap_model(self.model)(
-                    sample=x, timestep=_t, added_cond_kwargs=_cond
+                    sample=x, timestep=_t, added_cond_kwargs=cond
                 )
                 x_prev = self.scheduler.step(outputs.sample, t, x).prev_sample
                 x_prev = x_prev.clamp(-1, 1)
