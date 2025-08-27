@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, model_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class DatasetConfig(BaseModel):
@@ -9,10 +9,12 @@ class DatasetConfig(BaseModel):
     num_classes: int | None = None
     grayscale: bool | None = None
     # 他設定の定義
-    image_dir: str = "D:/Datasets/CelebAMask-HQ/CelebA-HQ-img-512/"
-    label_dir: str = "D:/Datasets/CelebAMask-HQ/CelebAMask-HQ-mask-img/"
-    conds_json: str = "D:/Datasets/CelebAMask-HQ/conditions.json"
+    image_dir: str | None = None
+    label_dir: str | None = None
+    conds_json: str | None = None
     num_workers: int = 8
+    image_suffix: str = ".jpg"
+    label_suffix: str = ".png"
 
 
 class TrainConfig(BaseModel):
@@ -81,8 +83,11 @@ class Config(BaseSettings):
     model: ModelConfig = ModelConfig()
     scheduler: SchedulerConfig = SchedulerConfig()
 
-    class Config:
-        env_nested_delimiter = "__"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_nested_delimiter="__",
+        extra="ignore",  # 不要なら削除
+    )
 
     @model_validator(mode="after")
     def _update(self):
