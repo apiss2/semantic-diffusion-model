@@ -86,6 +86,7 @@ def log_images(
     # 画像を uint8 (B,H,W,3) に整形
     inference_img = to_uint8_image_batch(inference_img, grayscale)
     src_img = to_uint8_image_batch(src_img, grayscale)
+    snapshots = {k: to_uint8_image_batch(i, grayscale) for k, i in snapshots.items()}
 
     assert cond_map.dim() == 4
     if cond_map.shape[1] > 1 and cond_map.dtype != torch.long:
@@ -123,7 +124,7 @@ def log_images(
         axs[2, k].axis("off")
 
         for i, snap in enumerate(snapshots.values()):
-            tmp = np.clip(snap[k, :c, ...].cpu().detach().numpy(), 0, 1)
+            tmp = np.clip(snap[k, ..., :c], 0, 1)
             axs[i + 3, k].imshow(tmp.transpose(1, 2, 0), **kwargs)
             axs[i + 3, k].axis("off")
 

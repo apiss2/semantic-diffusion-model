@@ -316,7 +316,7 @@ class TrainLoop:
                 x_prev = x_prev.clamp(-1, 1)
                 if i in snapshot_steps:
                     idx = snapshot_steps.index(i)
-                    snapshots[snapshot_names[idx]] = (x_prev + 1) / 2.0
+                    snapshots[snapshot_names[idx]] = x_prev
                 x = x_prev
         self.accelerator.unwrap_model(self.model).train()
 
