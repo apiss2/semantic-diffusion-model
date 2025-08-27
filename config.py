@@ -22,7 +22,7 @@ class TrainConfig(BaseModel):
     grayscale: bool | None = None
     # 他設定の定義
     lr: float = 1e-4
-    ema_rate: str = "0.9,0.99"  # comma-separated list of EMA values
+    ema_rate: str = "0.999,0.9999"  # comma-separated list of EMA values
     weight_decay: float = 1e-3
     lr_anneal_steps: int = 100000
     save_interval: int = 10000
