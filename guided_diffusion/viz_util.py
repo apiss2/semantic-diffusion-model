@@ -124,8 +124,7 @@ def log_images(
         axs[2, k].axis("off")
 
         for i, snap in enumerate(snapshots.values()):
-            tmp = np.clip(snap[k, ..., :c], 0, 1)
-            axs[i + 3, k].imshow(tmp.transpose(1, 2, 0), **kwargs)
+            axs[i + 3, k].imshow(snap[k, ..., :c], **kwargs)
             axs[i + 3, k].axis("off")
 
     axs[0, 0].set_title("Source Image")

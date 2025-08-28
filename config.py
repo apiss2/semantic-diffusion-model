@@ -42,6 +42,7 @@ class ModelConfig(BaseModel):
     # 複数の設定に跨る値を定義
     image_size: int | None = None
     num_classes: int | None = None
+    grayscale: bool | None = None
     # 他設定の定義
     model_channels: int = 128
     num_res_blocks: int = 2
@@ -56,16 +57,15 @@ class ModelConfig(BaseModel):
     resblock_updown: bool = True
     predict_sigma: bool = False  # Schedulerに従って自動で切替
     use_sdpa_attn: bool = False
-    cond_spec: dict[str, dict[str, str | int]] = {
-        "gender": {"type": "categorical", "num_classes": 2},
-    }
+    cond_spec: dict[str, dict[str, str | int]] | None = None
+    # {"gender": {"type": "categorical", "num_classes": 2}}
 
 
 class SchedulerConfig(BaseModel):
     num_train_timesteps: int = 1000
     beta_schedule: str = "squaredcos_cap_v2"  # 他squaredcos_cap_v2等
     prediction_type: str = "epsilon"  # ε予測
-    variance_type: str = "fixed_small"  # or fixed_small
+    variance_type: str = "fixed_small"  # fixed_small or learned_range
     clip_sample: bool = True
 
 
@@ -106,7 +106,7 @@ class Config(BaseSettings):
             "image_size": ("dataset", "model"),
             "batch_size": ("dataset", "train"),
             "num_classes": ("dataset", "train", "model"),
-            "grayscale": ("dataset", "train"),
+            "grayscale": ("dataset", "train", "model"),
         }
 
         for key, sections in shared_map.items():
