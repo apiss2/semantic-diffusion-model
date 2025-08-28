@@ -191,10 +191,9 @@ class TrainLoop:
                     _cond["conds"] = conds
                 outputs = self.model(sample=x_t, timestep=t, added_cond_kwargs=_cond)
                 model_out = outputs.sample
+                loss = 0
                 if self.model.predict_sigma:
                     eps_pred, var_raw = torch.chunk(model_out, 2, dim=1)
-                    # ====== MSE(ε) ======
-                    loss = ((noise - eps_pred) ** 2).mean(dim=(1, 2, 3))
                     # ====== VB 項（KL or NLL@t=0） ======
                     loss += vb_terms_bits_per_dim(
                         scheduler=self.scheduler,
@@ -205,7 +204,16 @@ class TrainLoop:
                         var_raw=var_raw,
                     )
                 else:
-                    loss = ((noise - model_out) ** 2).mean(dim=(1, 2, 3))
+                    eps_pred = model_out
+                # ====== MSE(ε) ======
+                pred_type = self.scheduler.config.prediction_type
+                if pred_type == "epsilon":
+                    target = noise
+                elif pred_type == "v_prediction":
+                    target = self.scheduler.get_velocity(batch, noise, t)
+                elif pred_type == "sample":
+                    target = batch
+                loss += ((target - eps_pred) ** 2).mean(dim=(1, 2, 3))
                 # total loss
                 loss = (loss * weights).mean()
 
@@ -251,7 +259,7 @@ class TrainLoop:
             # ema decay（定数でも“随時”出す）
             for i, r in enumerate(self.ema_rate):
                 self.tb.add_scalar(f"ema/decay_{i}", float(r), gstep)
-            # 100step ごとに EMA と本体の L2 距離も出す（任意）
+            # 100step ごとに EMA と本体の L2 距離も出す
             if (gstep % 100 == 0) and (len(self.ema_models) > 0):
                 ema0 = self.ema_models[0]
                 dist_sq = 0.0
@@ -295,42 +303,41 @@ class TrainLoop:
     def sanity_test(
         self, batch: torch.Tensor, device: str, cond: dict[str, torch.Tensor]
     ):
-        self.accelerator.unwrap_model(self.model).eval()
-        x = torch.randn_like(batch, device=device) * self.scheduler.init_noise_sigma
+        model = self.accelerator.unwrap_model(self.model)
+        model.eval()
+
+        # 学習スケジューラから推論用を生成し、明示的にステップ数を設定
+        sched = create_inference_scheduler(
+            self.inference_scheduler_default, self.scheduler
+        )
+        num_inference_steps = 50
+        sched.set_timesteps(num_inference_steps, device=device)
+
+        x = torch.randn_like(batch, device=device) * sched.init_noise_sigma
         cond["semantic_map"] = cond["semantic_map"].to(device)
         if "conds" in cond:
             cond["conds"] = {k: v.to(device) for k, v in cond["conds"].items()}
-        total_steps = len(self.scheduler.timesteps)
-        snapshot_names = ["25%", "50%", "75%"]
-        snapshot_steps = [total_steps // 4 * i for i in range(1, 4)]
-        snapshots = dict()
-        with torch.no_grad():
-            _iter = enumerate(self.scheduler.timesteps)
-            disable = not self.accelerator.is_main_process
-            for i, t in tqdm(_iter, total=total_steps, disable=disable):
-                _t = torch.tensor([t] * x.shape[0], device=device)
-                outputs = self.accelerator.unwrap_model(self.model)(
-                    sample=x, timestep=_t, added_cond_kwargs=cond
-                )
-                x_prev = self.scheduler.step(outputs.sample, t, x).prev_sample
-                x_prev = x_prev.clamp(-1, 1)
-                if i in snapshot_steps:
-                    idx = snapshot_steps.index(i)
-                    snapshots[snapshot_names[idx]] = x_prev
-                x = x_prev
-        self.accelerator.unwrap_model(self.model).train()
 
-        if self.accelerator.is_main_process:
-            log_images(
-                src_img=batch.to(device),
-                cond_map=cond["semantic_map"],
-                inference_img=x,
-                snapshots=snapshots,
-                output_dir=self.save_dir / "snapshots",
-                class_num=self.num_classes,
-                step=self.step,
-                grayscale=self.grayscale,
-            )
+        snaps_idx = [num_inference_steps // 4 * i for i in range(1, 4)]
+        snapshots = dict()
+        for i, t in tqdm(enumerate(sched.timesteps), total=num_inference_steps):
+            out = model(sample=x, timestep=t, added_cond_kwargs=cond).sample
+            x = sched.step(out, t, x).prev_sample
+            if i in snaps_idx:
+                snapshots[f"{int(100 * i / num_inference_steps)}%"] = x
+
+        model.train()
+
+        log_images(
+            src_img=batch.to(device),
+            cond_map=cond["semantic_map"],
+            inference_img=x,
+            snapshots=snapshots,
+            output_dir=self.save_dir / "snapshots",
+            class_num=self.num_classes,
+            step=self.step,
+            grayscale=self.grayscale,
+        )
 
     @torch.no_grad()
     def generate_with_cfg(
