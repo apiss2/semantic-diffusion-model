@@ -303,28 +303,41 @@ class TrainLoop:
     def sanity_test(
         self, batch: torch.Tensor, device: str, cond: dict[str, torch.Tensor]
     ):
-        model = self.accelerator.unwrap_model(self.model)
-        model.eval()
-
-        # 学習スケジューラから推論用を生成し、明示的にステップ数を設定
+        # 推論用スケジューラのセットアップ
         sched = create_inference_scheduler(
             self.inference_scheduler_default, self.scheduler
         )
         num_inference_steps = 50
         sched.set_timesteps(num_inference_steps, device=device)
 
-        x = torch.randn_like(batch, device=device) * sched.init_noise_sigma
+        # ノイズ初期化（fp16なら半精度）
+        dtype = next(self.model.parameters()).dtype
+        x = torch.randn_like(batch, dtype=dtype, device=device)
+        # diffusers系は init_noise_sigma がある場合が多い
+        if hasattr(sched, "init_noise_sigma") and sched.init_noise_sigma is not None:
+            x = x * getattr(sched, "init_noise_sigma")
+
+        # 条件をGPUに
         cond["semantic_map"] = cond["semantic_map"].to(device)
         if "conds" in cond:
             cond["conds"] = {k: v.to(device) for k, v in cond["conds"].items()}
 
+        # モデルの準備
+        model = self.accelerator.unwrap_model(self.model)
+        model.eval()
+
+        # スナップショット保存しつつ推論
         snaps_idx = [num_inference_steps // 4 * i for i in range(1, 4)]
         snapshots = dict()
-        for i, t in tqdm(enumerate(sched.timesteps), total=num_inference_steps):
-            out = model(sample=x, timestep=t, added_cond_kwargs=cond).sample
-            x = sched.step(out, t, x).prev_sample
-            if i in snaps_idx:
-                snapshots[f"{int(100 * i / num_inference_steps)}%"] = x
+        with torch.inference_mode():
+            for i, t in tqdm(enumerate(sched.timesteps), total=num_inference_steps):
+                out = model(sample=x, timestep=t, added_cond_kwargs=cond).sample
+                # predict_sigma=True の場合は [eps, var] の2C出力になるので eps だけ渡す
+                if out.shape[1] == x.shape[1] * 2:
+                    out = out[:, : x.shape[1]]
+                x = sched.step(out, t, x).prev_sample
+                if i in snaps_idx:
+                    snapshots[f"{int(100 * i / num_inference_steps)}%"] = x
 
         model.train()
 
