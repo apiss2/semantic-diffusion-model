@@ -1,4 +1,3 @@
-import copy
 from pathlib import Path
 from typing import Iterator
 
@@ -12,12 +11,13 @@ from diffusers.schedulers import (
     UniPCMultistepScheduler,
 )
 from torch.optim import AdamW
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from .losses import vb_terms_bits_per_dim
-from .model import UNetModel, update_ema
+from .model import UNetModel
 from .viz_util import log_images
 
 
@@ -56,6 +56,7 @@ class TrainLoop:
         grad_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0,
         inference_scheduler: str = "ddim",
+        inference_timesteps: int = 1000,
         p2_loss_k: float = 0.0,
         p2_importance_sampling: bool = False,
     ):
@@ -94,6 +95,7 @@ class TrainLoop:
         self.device = self.accelerator.device
         self.max_grad_norm = max_grad_norm
         self.inference_scheduler_default = inference_scheduler
+        self.inference_timesteps = inference_timesteps
 
         self.step = 1
         self.resume_step = 0
@@ -108,18 +110,11 @@ class TrainLoop:
         # --- DDP wrap ---
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
+        self.ema_models = [self._build_ema_model(rate) for rate in self.ema_rate]
         if self.resume_step:
             self._load_optimizer_state()
-            self.ema_models = [self._load_ema_model(rate) for rate in self.ema_rate]
-            self.ema_models = [m for m in self.ema_models if m is not None]
-        else:
-            self.ema_models = [
-                copy.deepcopy(self.accelerator.unwrap_model(self.model)).eval()
-                for _ in self.ema_rate
-            ]
-            for m in self.ema_models:
-                for p in m.parameters():
-                    p.requires_grad_(False)
+            for model, rate in zip(self.ema_models, self.ema_rate):
+                self._load_ema_weight(model, rate)
         # TensorBoard（rank0 のみ）
         self.tb: SummaryWriter | None = None
         if self.accelerator.is_main_process:
@@ -131,27 +126,31 @@ class TrainLoop:
             state = torch.load(self.resume_checkpoint, map_location="cpu")
             self.model.load_state_dict(state)
 
-    def _load_ema_model(self, rate):
+    def _build_ema_model(self, rate):
+        return AveragedModel(
+            self.model,
+            device="cpu",
+            multi_avg_fn=get_ema_multi_avg_fn(rate),
+            use_buffers=True,
+        ).eval()
+
+    def _load_ema_weight(self, model: AveragedModel, rate):
+        assert self.resume_checkpoint
         ema_checkpoint = find_ema_checkpoint(
             self.resume_checkpoint, self.resume_step, rate
         )
-        if ema_checkpoint:
-            model = copy.deepcopy(self.model).to("cpu")
-            state_dict = torch.load(ema_checkpoint, map_location="cpu")
-            model.load_state_dict(state_dict, strict=True)
-            return model.eval()
-        else:
-            return None
+        state_dict = torch.load(ema_checkpoint, map_location="cpu")
+        model.load_state_dict(state_dict, strict=True)
 
     def _load_optimizer_state(self):
-        if self.resume_checkpoint:
-            name = f"ckpt/opt{self.resume_step:06}.pt"
-            opt_checkpoint = self.save_dir / name
-            assert opt_checkpoint.exists()
-            opt_state = torch.load(opt_checkpoint, map_location="cpu")
-            self.opt.load_state_dict(opt_state)
-            if self.opt.param_groups[0]["lr"] != self.lr:
-                self.opt.param_groups[0]["lr"] = self.lr
+        assert self.resume_checkpoint
+        name = f"ckpt/opt{self.resume_step:06}.pt"
+        opt_checkpoint = self.save_dir / name
+        assert opt_checkpoint.exists()
+        opt_state = torch.load(opt_checkpoint, map_location="cpu")
+        self.opt.load_state_dict(opt_state)
+        if self.opt.param_groups[0]["lr"] != self.lr:
+            self.opt.param_groups[0]["lr"] = self.lr
 
     def run_loop(self):
         while (
@@ -247,7 +246,8 @@ class TrainLoop:
         self._anneal_lr()
 
         _loss = loss.detach().float().cpu().item()
-        self.accelerator.print(f"\rstep: {self.step} | loss: {loss:.4f}", end="")
+        step = self.step + self.resume_step
+        self.accelerator.print(f"\rstep: {step} | loss: {loss:.4f}", end="")
 
         # ===== TensorBoard =====
         if self.tb is not None:
@@ -263,17 +263,15 @@ class TrainLoop:
             if (gstep % 100 == 0) and (len(self.ema_models) > 0):
                 ema0 = self.ema_models[0]
                 dist_sq = 0.0
-                for p, q in zip(
-                    self.accelerator.unwrap_model(self.model).parameters(),
-                    ema0.parameters(),
-                ):
-                    dist_sq += float((p.detach() - q.detach()).pow(2).sum().item())
+                model = self.accelerator.unwrap_model(self.model)
+                for p, q in zip(model.parameters(), ema0.parameters()):
+                    v = (p.detach().cpu() - q.detach()).pow(2).sum()
+                    dist_sq += float(v.item())
                 self.tb.add_scalar("ema/distance_l2", dist_sq**0.5, gstep)
 
     def _update_ema(self):
-        src_params = self.accelerator.unwrap_model(self.model).parameters()
-        for rate, ema_model in zip(self.ema_rate, self.ema_models):
-            update_ema(ema_model.parameters(), src_params, rate=float(rate))
+        for model in self.ema_models:
+            model.update_parameters(self.model)
 
     def _anneal_lr(self):
         if not self.lr_anneal_steps:
@@ -307,7 +305,7 @@ class TrainLoop:
         sched = create_inference_scheduler(
             self.inference_scheduler_default, self.scheduler
         )
-        num_inference_steps = 50
+        num_inference_steps = self.inference_timesteps
         sched.set_timesteps(num_inference_steps, device=device)
 
         # ノイズ初期化（fp16なら半精度）
@@ -521,8 +519,10 @@ def find_ema_checkpoint(
 ) -> Path | None:
     if main_checkpoint is None:
         return None
-    filename = f"ema_{rate}_{(step):06d}.pt"
+    rate = "0" + str(rate).strip("0")
+    filename = f"ema_{rate}_{step:06d}.pt"
     path = main_checkpoint.parent.joinpath(filename)
     if path.exists():
         return path
-    return None
+    else:
+        raise FileNotFoundError(path.as_posix())
