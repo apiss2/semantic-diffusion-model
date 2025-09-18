@@ -1,7 +1,6 @@
 import math
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Iterator, Optional, Union
 
 import numpy as np
 import torch
@@ -885,11 +884,11 @@ class UNetModel(ModelMixin, ConfigMixin):
     def forward(
         self,
         sample: torch.FloatTensor,
-        timestep: Union[torch.Tensor, int, float],
+        timestep: torch.Tensor | int | float,
         *,
-        added_cond_kwargs: Optional[dict[str, torch.Tensor]] = None,
+        added_cond_kwargs: dict[str, torch.Tensor] | None = None,
         return_dict: bool = True,
-    ) -> Union[UNet2DOutput, torch.FloatTensor]:
+    ) -> UNet2DOutput | torch.FloatTensor:
         """diffusers 互換 forward。
         - 条件は added_cond_kwargs["semantic_map"] で受け取ります。
         - return_dict=True で UNet2DOutput を返します。
