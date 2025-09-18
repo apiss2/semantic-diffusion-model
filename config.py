@@ -1,10 +1,18 @@
+import json
+from pathlib import Path
+
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+class Transform(BaseModel):
+    name: str
+    kwargs: dict[str, str | int | float | tuple[float, float] | tuple[int, int]]
+    transforms: list["Transform"] | None = None
+
+
 class DatasetConfig(BaseModel):
     # 複数の設定に跨る値を定義
-    image_size: int | None = None
     batch_size: int | None = None
     num_classes: int | None = None
     grayscale: bool | None = None
@@ -15,6 +23,9 @@ class DatasetConfig(BaseModel):
     num_workers: int = 8
     image_suffix: str = ".jpg"
     label_suffix: str = ".png"
+    transforms: list[Transform] = [
+        Transform(name="Resize", kwargs={"height": 256, "width": 256}),
+    ]
 
 
 class TrainConfig(BaseModel):
@@ -34,16 +45,17 @@ class TrainConfig(BaseModel):
     grad_accumulation_steps: int = 1
     max_grad_norm: float = 1.0
     inference_scheduler: str = "ddim"
+    inference_timesteps: int = 200
     p2_loss_k: float = 0.0
     p2_importance_sampling: bool = False
 
 
 class ModelConfig(BaseModel):
     # 複数の設定に跨る値を定義
-    image_size: int | None = None
     num_classes: int | None = None
     grayscale: bool | None = None
     # 他設定の定義
+    image_size: int = 256
     model_channels: int = 128
     num_res_blocks: int = 2
     num_heads: int = 1
@@ -73,7 +85,6 @@ class Config(BaseSettings):
     save_dir_root: str = "./results/"
 
     # 複数の設定に跨る値を定義
-    image_size: int = Field(128)
     batch_size: int = Field(8)
     num_classes: int = Field(19)
     grayscale: bool = Field(False)
@@ -103,7 +114,6 @@ class Config(BaseSettings):
         - サブ設定の値が親と異なれば明示エラー
         """
         shared_map = {
-            "image_size": ("dataset", "model"),
             "batch_size": ("dataset", "train"),
             "num_classes": ("dataset", "train", "model"),
             "grayscale": ("dataset", "train", "model"),
@@ -120,3 +130,14 @@ class Config(BaseSettings):
                 elif sub_val != top_val:
                     raise ValueError(f"{sec}.{key}({sub_val}) != {key}({top_val})")
         return self
+
+    @classmethod
+    def from_json(cls, path: str | Path) -> "Config":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return cls(**data)
+
+    def to_json(self, path: str | Path) -> None:
+        json_str = self.model_dump_json(indent=4)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json_str)

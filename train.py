@@ -1,6 +1,9 @@
 import json
-from pathlib import Path
+from argparse import ArgumentParser, Namespace
 from datetime import datetime
+from pathlib import Path
+
+import albumentations as A
 import torch
 from diffusers.schedulers import DDPMScheduler
 
@@ -10,9 +13,19 @@ from guided_diffusion.model import UNetModel
 from guided_diffusion.train_util import TrainLoop
 
 
+def get_args() -> Namespace:
+    parser = ArgumentParser()
+    parser.add_argument("--config", type=Path)
+    return parser.parse_args()
+
+
 def main():
     assert torch.cuda.is_available()
-    config = Config()
+    args = get_args()
+    if args.config:
+        config = Config.from_json(args.config)
+    else:
+        config = Config()
 
     # 保存先の作成
     if config.train.resume_checkpoint == "":
@@ -30,7 +43,9 @@ def main():
     # モデル等の定義
     model = UNetModel(**config.model.model_dump()).to("cuda")
     scheduler = DDPMScheduler(**config.scheduler.model_dump())
-    data = create_dataloader(**config.dataset.model_dump())
+    kwargs = config.dataset.model_dump()
+    kwargs.update(transforms=build_transforms(config))
+    data = create_dataloader(**kwargs)
 
     # 学習
     TrainLoop(
@@ -40,6 +55,19 @@ def main():
         save_dir=save_dir,
         **config.train.model_dump(),
     ).run_loop()
+
+
+def build_transforms(config: Config) -> A.Compose:
+    def _build_transform(t) -> A.BasicTransform:
+        if not hasattr(A, t.name):
+            raise ValueError(f"{t.name} is not in Albumentations")
+        Tfm = getattr(A, t.name)
+        if t.transforms is not None:
+            return Tfm([_build_transform(child) for child in t.transforms], **t.kwargs)
+        else:
+            return Tfm(**t.kwargs)
+
+    return A.Compose([_build_transform(t) for t in config.dataset.transforms])
 
 
 if __name__ == "__main__":

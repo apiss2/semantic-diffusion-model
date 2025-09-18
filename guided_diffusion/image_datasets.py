@@ -14,7 +14,6 @@ def create_dataloader(
     image_dir,
     label_dir,
     conds_json,
-    image_size,
     num_classes,
     batch_size,
     num_workers,
@@ -32,7 +31,6 @@ def create_dataloader(
         label_suffix=label_suffix,
         transforms=transforms,
         num_classes=num_classes,
-        size=image_size,
         grayscale=grayscale,
     )
 
@@ -70,7 +68,6 @@ class SDMDataset(Dataset):
         label_suffix=".png",
         transforms: A.Compose | None = None,
         num_classes: int = 19,  # 0(背景)を含んだクラス数
-        size: int = 256,
         grayscale: bool = False,
     ):
         self.grayscale = grayscale
@@ -109,16 +106,9 @@ class SDMDataset(Dataset):
                 self.label_pathes.append(label_path)
                 for key, v in cond.items():
                     self.conds[key].append(v)
-        # データ拡張について指定が無い場合にはリサイズとフリップのみ
-        if transforms is None:
-            self.transforms = A.Compose(
-                [
-                    A.Resize(size, size),
-                    A.HorizontalFlip(),
-                ]
-            )
-        else:
-            self.transforms = transforms
+        print("total data num:", len(self.image_pathes))
+        # データ拡張
+        assert transforms is not None
 
     def __len__(self):
         return len(self.image_pathes)
